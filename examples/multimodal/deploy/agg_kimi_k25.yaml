@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: agg-kimi-k25
+spec:
+  backendFramework: sglang
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          image: my-registry/sglang-runtime:my-tag
+    EncodeWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: my-registry/sglang-runtime:my-tag
+          workingDir: /workspace/examples/multimodal
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - python3 components/encode_worker.py --model moonshotai/Kimi-K2.5
+    VLMWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: my-registry/sglang-runtime:my-tag
+          workingDir: /workspace/examples/multimodal
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - python3 components/worker.py --model moonshotai/Kimi-K2.5 --worker-type prefill
+    Processor:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: my-registry/sglang-runtime:my-tag
+          workingDir: /workspace/examples/multimodal
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - 'python3 components/processor.py --model moonshotai/Kimi-K2.5 --prompt-template "<|media_begin|>image<|media_content|><|media_pad|><|media_end|><prompt>"'

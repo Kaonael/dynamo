@@ -99,6 +99,40 @@ impl Default for DsmlParserConfig {
     }
 }
 
+/// Configuration for Kimi K2.5 tool call parser
+///
+/// Format:
+/// ```text
+/// <|tool_calls_section_begin|>
+/// <|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+/// <|tool_calls_section_end|>
+/// ```
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct KimiK25ParserConfig {
+    /// Start token for the tool calls section (e.g., "<|tool_calls_section_begin|>")
+    pub section_start: String,
+    /// End token for the tool calls section (e.g., "<|tool_calls_section_end|>")
+    pub section_end: String,
+    /// Start token for an individual tool call (e.g., "<|tool_call_begin|>")
+    pub call_start: String,
+    /// End token for an individual tool call (e.g., "<|tool_call_end|>")
+    pub call_end: String,
+    /// Token separating function ID from JSON arguments (e.g., "<|tool_call_argument_begin|>")
+    pub argument_begin: String,
+}
+
+impl Default for KimiK25ParserConfig {
+    fn default() -> Self {
+        Self {
+            section_start: "<|tool_calls_section_begin|>".to_string(),
+            section_end: "<|tool_calls_section_end|>".to_string(),
+            call_start: "<|tool_call_begin|>".to_string(),
+            call_end: "<|tool_call_end|>".to_string(),
+            argument_begin: "<|tool_call_argument_begin|>".to_string(),
+        }
+    }
+}
+
 /// Parser-specific configuration
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -109,6 +143,7 @@ pub enum ParserConfig {
     Harmony(JsonParserConfig),
     Typescript,
     Dsml(DsmlParserConfig),
+    KimiK25(KimiK25ParserConfig),
 }
 
 impl ParserConfig {
@@ -122,6 +157,7 @@ impl ParserConfig {
             ParserConfig::Pythonic => vec![],
             ParserConfig::Typescript => vec![],
             ParserConfig::Dsml(config) => vec![config.function_calls_start.clone()],
+            ParserConfig::KimiK25(config) => vec![config.section_start.clone()],
         }
     }
 
@@ -135,6 +171,7 @@ impl ParserConfig {
             ParserConfig::Pythonic => vec![],
             ParserConfig::Typescript => vec![],
             ParserConfig::Dsml(config) => vec![config.function_calls_end.clone()],
+            ParserConfig::KimiK25(config) => vec![config.section_end.clone()],
         }
     }
 }
@@ -312,6 +349,17 @@ impl ToolCallConfig {
                 parameter_start_token: "<parameter name=".to_string(),
                 parameter_end_token: "</parameter>".to_string(),
             }),
+        }
+    }
+
+    pub fn kimi_k25() -> Self {
+        // Kimi K2.5 format:
+        // <|tool_calls_section_begin|>
+        // <|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+        // <|tool_calls_section_end|>
+        // Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
+        Self {
+            parser_config: ParserConfig::KimiK25(KimiK25ParserConfig::default()),
         }
     }
 }

@@ -82,6 +82,10 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler):
 
             # Use the image_pad token as the main image token
             self.image_token_id = image_pad_id
+        elif "<|media_pad|>" in image_token_str:
+            # Kimi K2.5 uses <|media_begin|>image<|media_content|><|media_pad|>...<|media_end|>
+            media_pad_id = self.tokenizer.convert_tokens_to_ids("<|media_pad|>")
+            self.image_token_id = media_pad_id
         else:
             # Fallback for other models
             self.image_token_id = self.tokenizer.convert_tokens_to_ids(image_token_str)

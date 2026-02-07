@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: kimi-k25
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        volumes:
+        - name: model-weights
+          hostPath:
+            path: /var/snap/microk8s/common/default-storage/default-kimi-k2-5-weights-pvc-aa558ba2-f0d9-4867-a10b-ea2f44c8def6
+            type: Directory
+        mainContainer:
+          image: localhost:32000/dynamo:sglang-runtime
+          volumeMounts:
+          - name: model-weights
+            mountPath: /models/Kimi-K2.5
+            readOnly: true
+    decode:
+      componentType: worker
+      replicas: 1
+      resources:
+        limits:
+          gpu: "8"
+      extraPodSpec:
+        volumes:
+        - name: model-weights
+          hostPath:
+            path: /var/snap/microk8s/common/default-storage/default-kimi-k2-5-weights-pvc-aa558ba2-f0d9-4867-a10b-ea2f44c8def6
+            type: Directory
+        mainContainer:
+          image: localhost:32000/dynamo:sglang-runtime
+          volumeMounts:
+          - name: model-weights
+            mountPath: /models/Kimi-K2.5
+          workingDir: /workspace/examples/backends/sglang
+          command:
+            - python3
+            - -m
+            - dynamo.sglang
+          args:
+            - --model-path
+            - /models/Kimi-K2.5
+            - --served-model-name
+            - moonshotai/Kimi-K2.5
+            - --tp
+            - "8"
+            - --trust-remote-code
+            - --dyn-tool-call-parser
+            - kimi_k25
+            - --dyn-reasoning-parser
+            - kimi_k25

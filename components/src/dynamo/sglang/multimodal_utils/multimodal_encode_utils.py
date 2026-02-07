@@ -14,6 +14,7 @@ class SupportedModels:
     """Supported multimodal model identifiers"""
 
     QWEN_2_5_VL_7B = "Qwen/Qwen2.5-VL-7B-Instruct"
+    KIMI_K2_5 = "moonshotai/Kimi-K2.5"
 
 
 def normalize_model_name(model_name: str) -> str:
@@ -154,6 +155,13 @@ def encode_image_embeddings(
         # Route through the correct encoder based on model
         if is_model_supported(model_name, SupportedModels.QWEN_2_5_VL_7B):
             embeddings = get_qwen_image_features(vision_encoder, image_embeds)
+
+        elif is_model_supported(model_name, SupportedModels.KIMI_K2_5):
+            from dynamo.sglang.multimodal_utils.kimi_k25_encode_utils import (
+                get_kimi_k25_image_features,
+            )
+
+            embeddings = get_kimi_k25_image_features(vision_encoder, image_embeds)
 
         else:
             # Provide more helpful error message with normalized model name

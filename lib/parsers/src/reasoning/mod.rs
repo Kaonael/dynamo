@@ -24,7 +24,7 @@ fn get_reasoning_parser_map() -> &'static HashMap<&'static str, ReasoningParserT
         map.insert("qwen3", ReasoningParserType::Qwen);
         map.insert("nemotron_deci", ReasoningParserType::NemotronDeci);
         map.insert("kimi", ReasoningParserType::Kimi);
-        map.insert("kimi_k25", ReasoningParserType::KimiK25);
+        map.insert("kimi_k25", ReasoningParserType::Qwen);
         map.insert("step3", ReasoningParserType::Step3);
         map.insert("mistral", ReasoningParserType::Mistral);
         map.insert("granite", ReasoningParserType::Granite);
@@ -91,7 +91,6 @@ pub enum ReasoningParserType {
     Qwen,
     NemotronDeci,
     Kimi,
-    KimiK25,
     Mistral,
     Granite,
 }
@@ -143,14 +142,6 @@ impl ReasoningParserType {
                     "◁think▷".into(),
                     "◁/think▷".into(),
                     false,
-                    true,
-                )),
-            },
-            ReasoningParserType::KimiK25 => ReasoningParserWrapper {
-                parser: Box::new(BasicReasoningParser::new(
-                    "<think>".into(),
-                    "</think>".into(),
-                    true,
                     true,
                 )),
             },

@@ -13,14 +13,13 @@ spec:
       extraPodSpec:
         volumes:
         - name: model-weights
-          hostPath:
-            path: /var/snap/microk8s/common/default-storage/default-kimi-k2-5-weights-pvc-aa558ba2-f0d9-4867-a10b-ea2f44c8def6
-            type: Directory
+          persistentVolumeClaim:
+            claimName: kimi-k2-5-weights
         mainContainer:
           image: localhost:32000/dynamo:sglang-runtime
           volumeMounts:
           - name: model-weights
-            mountPath: /models/Kimi-K2.5
+            mountPath: /models
             readOnly: true
     decode:
       componentType: worker
@@ -31,14 +30,13 @@ spec:
       extraPodSpec:
         volumes:
         - name: model-weights
-          hostPath:
-            path: /var/snap/microk8s/common/default-storage/default-kimi-k2-5-weights-pvc-aa558ba2-f0d9-4867-a10b-ea2f44c8def6
-            type: Directory
+          persistentVolumeClaim:
+            claimName: kimi-k2-5-weights
         mainContainer:
           image: localhost:32000/dynamo:sglang-runtime
           volumeMounts:
           - name: model-weights
-            mountPath: /models/Kimi-K2.5
+            mountPath: /models
           workingDir: /workspace/examples/backends/sglang
           command:
             - python3

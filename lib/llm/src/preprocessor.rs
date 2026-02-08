@@ -918,6 +918,25 @@ impl OpenAIPreprocessor {
         jail.apply_with_finish_reason(stream)
     }
 
+    /// Check if reasoning parsing should be disabled based on per-request parameters.
+    /// For kimi_k25: disabled when chat_template_args contains "thinking": false.
+    fn is_reasoning_disabled_by_request(
+        reasoning_parser: Option<&str>,
+        chat_template_args: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) -> bool {
+        match reasoning_parser {
+            Some("kimi_k25") => {
+                if let Some(args) = chat_template_args {
+                    if let Some(thinking) = args.get("thinking") {
+                        return thinking == &serde_json::Value::Bool(false);
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     // Motivation: Each transformation on the stream should be a separate step to allow for more flexibility
     // Earlier reasoning parser logic was nested under delta generation logic in choice_from_postprocessor
     // Since we have tool calling parsing as separate step, it makes sense to have reasoning parser as separate step as well
@@ -1053,7 +1072,11 @@ impl
         );
 
         // Try to parse reasoning content only if parser is configured
-        let should_parse_reasoning = self.runtime_config.reasoning_parser.is_some();
+        let should_parse_reasoning = self.runtime_config.reasoning_parser.is_some()
+            && !Self::is_reasoning_disabled_by_request(
+                self.runtime_config.reasoning_parser.as_deref(),
+                request.chat_template_args.as_ref(),
+            );
 
         // Reasoning Content Parsing Transformation Step
         // Current Solution:

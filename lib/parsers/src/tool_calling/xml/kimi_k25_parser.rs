@@ -4,11 +4,36 @@
 // Reference implementation:
 // https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/function_call/kimik2_detector.py
 
+use std::sync::OnceLock;
+
 use regex::Regex;
 
 use super::super::ToolDefinition;
 use super::super::config::KimiK25ParserConfig;
 use super::response::{CalledFunction, ToolCallResponse, ToolCallType};
+
+static TOOL_CALL_REGEX: OnceLock<Regex> = OnceLock::new();
+static ID_REGEX: OnceLock<Regex> = OnceLock::new();
+
+fn get_tool_call_regex() -> &'static Regex {
+    TOOL_CALL_REGEX.get_or_init(|| {
+        let config = KimiK25ParserConfig::default();
+        let pattern = format!(
+            r"(?s){}\s*(?P<function_id>[\w.:]+)\s*{}\s*(?P<arguments>\{{.*?\}})\s*{}",
+            regex::escape(&config.call_start),
+            regex::escape(&config.argument_begin),
+            regex::escape(&config.call_end),
+        );
+        Regex::new(&pattern).expect("Failed to compile kimi k25 tool call regex")
+    })
+}
+
+fn get_id_regex() -> &'static Regex {
+    ID_REGEX.get_or_init(|| {
+        Regex::new(r"^(?:functions\.)?(?P<name>[\w\.]+):(?P<index>\d+)$")
+            .expect("Failed to compile kimi k25 id regex")
+    })
+}
 
 /// Check if a chunk contains the start of a Kimi K2.5-style tool call.
 /// Detects `<|tool_calls_section_begin|>` or partial match for streaming.
@@ -93,7 +118,7 @@ fn extract_tool_calls(
                 let block = &text[abs_start..abs_end];
 
                 // Parse individual tool calls within this section block.
-                if let Ok(mut parsed_calls) = parse_section_block(block, config, tools) {
+                if let Ok(mut parsed_calls) = parse_section_block(block, tools) {
                     calls.append(&mut parsed_calls);
                 }
 
@@ -120,25 +145,10 @@ fn extract_tool_calls(
 /// Each individual call is between `<|tool_call_begin|>` and `<|tool_call_end|>`.
 fn parse_section_block(
     block: &str,
-    config: &KimiK25ParserConfig,
     tools: Option<&[ToolDefinition]>,
 ) -> anyhow::Result<Vec<ToolCallResponse>> {
-    let call_start = &config.call_start;
-    let call_end = &config.call_end;
-    let arg_begin = &config.argument_begin;
-
-    // Regex to match: <|tool_call_begin|>\s*FUNCTION_ID<|tool_call_argument_begin|>\s*JSON_ARGS\s*<|tool_call_end|>
-    let pattern = format!(
-        r"(?s){}\s*(?P<function_id>[^\s<]+)\s*{}\s*(?P<arguments>\{{.*?\}})\s*{}",
-        regex::escape(call_start),
-        regex::escape(arg_begin),
-        regex::escape(call_end),
-    );
-
-    let tool_call_regex = Regex::new(&pattern)?;
-
-    // Regex for parsing function IDs like "functions.get_weather:0" or "get_weather:0"
-    let id_regex = Regex::new(r"^(?:functions\.)?(?P<name>[\w\.]+):(?P<index>\d+)$")?;
+    let tool_call_regex = get_tool_call_regex();
+    let id_regex = get_id_regex();
 
     let mut results = Vec::new();
 

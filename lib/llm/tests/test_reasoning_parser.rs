@@ -402,6 +402,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reasoning_parser_with_kimi_k25_thinking_mode() {
+        // KimiK25 default (thinking mode): <think>reasoning</think>content
+        // force_reasoning=true, so model always starts with reasoning
+        let input_chunks = vec![
+            create_mock_response_chunk("<think>Let me".to_string(), None),
+            create_mock_response_chunk(" think about this carefully.".to_string(), None),
+            create_mock_response_chunk("</think>Bonjour!".to_string(), None),
+        ];
+        let input_stream = stream::iter(input_chunks);
+
+        let output_stream = OpenAIPreprocessor::parse_reasoning_content_from_stream(
+            input_stream,
+            "kimi_k25".to_string(),
+        );
+
+        let mut output_stream = std::pin::pin!(output_stream);
+        let mut all_reasoning = String::new();
+        let mut all_content = String::new();
+        while let Some(chunk) = output_stream.next().await {
+            if let Some(ref data) = chunk.data {
+                for choice in &data.choices {
+                    if let Some(ref r) = choice.delta.reasoning_content {
+                        all_reasoning.push_str(r);
+                    }
+                    if let Some(ref c) = choice.delta.content {
+                        all_content.push_str(c);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(all_reasoning, "Let me think about this carefully.");
+        assert_eq!(all_content, "Bonjour!");
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_parser_with_kimi_k25_instant_mode() {
+        // KimiK25 instant mode: model emits <think></think> then content
+        // Parser should produce empty reasoning and all content as normal text
+        let input_chunks = vec![
+            create_mock_response_chunk("<think>".to_string(), None),
+            create_mock_response_chunk("</think>".to_string(), None),
+            create_mock_response_chunk("Direct answer without thinking.".to_string(), None),
+        ];
+        let input_stream = stream::iter(input_chunks);
+
+        let output_stream = OpenAIPreprocessor::parse_reasoning_content_from_stream(
+            input_stream,
+            "kimi_k25".to_string(),
+        );
+
+        let mut output_stream = std::pin::pin!(output_stream);
+        let mut all_reasoning = String::new();
+        let mut all_content = String::new();
+        while let Some(chunk) = output_stream.next().await {
+            if let Some(ref data) = chunk.data {
+                for choice in &data.choices {
+                    if let Some(ref r) = choice.delta.reasoning_content {
+                        all_reasoning.push_str(r);
+                    }
+                    if let Some(ref c) = choice.delta.content {
+                        all_content.push_str(c);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(all_reasoning, "");
+        assert_eq!(all_content, "Direct answer without thinking.");
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_parser_with_kimi_k25_token_by_token() {
+        // Simulate realistic token-by-token streaming for KimiK25
+        let input_chunks = vec![
+            create_mock_response_chunk("<think>".to_string(), None),
+            create_mock_response_chunk("The user".to_string(), None),
+            create_mock_response_chunk(" asked me".to_string(), None),
+            create_mock_response_chunk(" to say hello.".to_string(), None),
+            create_mock_response_chunk("</think>".to_string(), None),
+            create_mock_response_chunk("Hello".to_string(), None),
+            create_mock_response_chunk("!".to_string(), None),
+        ];
+        let input_stream = stream::iter(input_chunks);
+
+        let output_stream = OpenAIPreprocessor::parse_reasoning_content_from_stream(
+            input_stream,
+            "kimi_k25".to_string(),
+        );
+
+        let mut output_stream = std::pin::pin!(output_stream);
+        let mut all_reasoning = String::new();
+        let mut all_content = String::new();
+        while let Some(chunk) = output_stream.next().await {
+            if let Some(ref data) = chunk.data {
+                for choice in &data.choices {
+                    if let Some(ref r) = choice.delta.reasoning_content {
+                        all_reasoning.push_str(r);
+                    }
+                    if let Some(ref c) = choice.delta.content {
+                        all_content.push_str(c);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(all_reasoning, "The user asked me to say hello.");
+        assert_eq!(all_content, "Hello!");
+    }
+
+    #[tokio::test]
     async fn test_reasoning_parser_with_kimi_parser() {
         // Create a mock runtime config with Kimi reasoning parser
         let runtime_config = dynamo_llm::local_model::runtime_config::ModelRuntimeConfig {

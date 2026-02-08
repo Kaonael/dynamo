@@ -1301,3 +1301,75 @@ impl
 }
 
 // Note: tests for jailing and parser detection live in `lib/llm/tests/test_jail.rs`
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kimi_k25_reasoning_disabled_when_thinking_false() {
+        let mut args = std::collections::HashMap::new();
+        args.insert(
+            "thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        assert!(OpenAIPreprocessor::is_reasoning_disabled_by_request(
+            Some("kimi_k25"),
+            Some(&args),
+        ));
+    }
+
+    #[test]
+    fn test_kimi_k25_reasoning_enabled_when_thinking_true() {
+        let mut args = std::collections::HashMap::new();
+        args.insert(
+            "thinking".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
+            Some("kimi_k25"),
+            Some(&args),
+        ));
+    }
+
+    #[test]
+    fn test_kimi_k25_reasoning_enabled_when_no_args() {
+        // Default: no chat_template_args → reasoning enabled
+        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
+            Some("kimi_k25"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_kimi_k25_reasoning_enabled_when_empty_args() {
+        // Empty args (no "thinking" key) → reasoning enabled
+        let args = std::collections::HashMap::new();
+        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
+            Some("kimi_k25"),
+            Some(&args),
+        ));
+    }
+
+    #[test]
+    fn test_non_kimi_parser_never_disabled() {
+        let mut args = std::collections::HashMap::new();
+        args.insert(
+            "thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        // Other parsers should never be disabled by this check
+        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
+            Some("deepseek_r1"),
+            Some(&args),
+        ));
+        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
+            Some("basic"),
+            Some(&args),
+        ));
+        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
+            None,
+            Some(&args),
+        ));
+    }
+}

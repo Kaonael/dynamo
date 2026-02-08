@@ -29,7 +29,7 @@ pub use harmony::parse_tool_calls_harmony_complete;
 pub use json::try_tool_call_parse_json;
 pub use parsers::{
     detect_and_parse_tool_call, detect_tool_call_start, find_tool_call_end_position,
-    try_tool_call_parse,
+    get_tool_call_section_markers, try_tool_call_parse,
 };
 pub use pythonic::try_tool_call_parse_pythonic;
 pub use response::{CalledFunction, ToolCallResponse, ToolCallType};

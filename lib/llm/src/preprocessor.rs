@@ -987,6 +987,112 @@ impl OpenAIPreprocessor {
         })
         .fuse()
     }
+
+    /// Relocate tool call tokens from `reasoning_content` into `content`.
+    ///
+    /// When a model generates tool calls inside a `<think>` block (before
+    /// emitting `</think>`), the reasoning parser places them into
+    /// `delta.reasoning_content`.  The downstream tool-calling jail only
+    /// inspects `delta.content`, so the calls are silently lost.
+    ///
+    /// This stream transformation sits between the reasoning parser and the
+    /// jail.  When it encounters the tool-call section start marker inside
+    /// `reasoning_content`, it splits the chunk: text before the marker
+    /// stays as reasoning, and everything from the marker onward is moved
+    /// to `content` so the jail can detect it normally.
+    pub fn relocate_tool_calls_from_reasoning<S>(
+        stream: S,
+        section_start: String,
+        section_end: String,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        let state = (Box::pin(stream) as Pin<Box<dyn Stream<Item = _> + Send>>, false);
+
+        stream::unfold(state, move |(mut stream, mut in_tool_section)| {
+            let section_start = section_start.clone();
+            let section_end = section_end.clone();
+
+            async move {
+                let item: Annotated<NvCreateChatCompletionStreamResponse> =
+                    stream.next().await?;
+
+                let processed = item.map_data(|mut data| {
+                    for choice in data.choices.iter_mut() {
+                        let reasoning = match choice.delta.reasoning_content.take() {
+                            Some(r) => r,
+                            None => continue,
+                        };
+
+                        if in_tool_section {
+                            // We are inside a tool call section — everything goes to content
+                            if let Some(end_pos) = reasoning.find(&section_end) {
+                                // Section ends in this chunk
+                                let split = end_pos + section_end.len();
+                                let tool_part = &reasoning[..split];
+                                let after = &reasoning[split..];
+
+                                // Append tool part to content
+                                let content = choice.delta.content.get_or_insert_with(String::new);
+                                content.push_str(tool_part);
+
+                                // Remainder (if any) goes back to reasoning
+                                if !after.is_empty() {
+                                    choice.delta.reasoning_content = Some(after.to_string());
+                                }
+                                in_tool_section = false;
+                            } else {
+                                // Still inside section — move entire chunk to content
+                                let content = choice.delta.content.get_or_insert_with(String::new);
+                                content.push_str(&reasoning);
+                            }
+                        } else if let Some(start_pos) = reasoning.find(&section_start) {
+                            // Section starts in this chunk — split
+                            let before = &reasoning[..start_pos];
+                            let from_marker = &reasoning[start_pos..];
+
+                            if !before.is_empty() {
+                                choice.delta.reasoning_content = Some(before.to_string());
+                            }
+
+                            // Check if section also ends in this same chunk
+                            if let Some(end_offset) = from_marker.find(&section_end) {
+                                let split = end_offset + section_end.len();
+                                let tool_part = &from_marker[..split];
+                                let after = &from_marker[split..];
+
+                                let content = choice.delta.content.get_or_insert_with(String::new);
+                                content.push_str(tool_part);
+
+                                if !after.is_empty() {
+                                    // Text after section end goes back to reasoning
+                                    let rc = choice
+                                        .delta
+                                        .reasoning_content
+                                        .get_or_insert_with(String::new);
+                                    rc.push_str(after);
+                                }
+                                // in_tool_section remains false
+                            } else {
+                                // Section started but not ended
+                                let content = choice.delta.content.get_or_insert_with(String::new);
+                                content.push_str(from_marker);
+                                in_tool_section = true;
+                            }
+                        } else {
+                            // No tool call markers — restore reasoning as-is
+                            choice.delta.reasoning_content = Some(reasoning);
+                        }
+                    }
+                    Ok(data)
+                });
+
+                Some((processed, (stream, in_tool_section)))
+            }
+        })
+        .fuse()
+    }
 }
 
 // for pals, we do not want to add the generation prompt to the formatted prompt
@@ -1104,6 +1210,31 @@ impl
             request.inner.tool_choice.as_ref(),
             has_tools,
         )?;
+
+        // Relocate tool calls from reasoning_content to content.
+        // When a model generates tool calls inside a <think> block, the reasoning
+        // parser places them into delta.reasoning_content. The jail only inspects
+        // delta.content, so without this step the calls are silently lost.
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> =
+            if should_parse_reasoning && should_jail {
+                if let Some(ref parser_name) = self.tool_call_parser {
+                    if let Some((section_start, section_end)) =
+                        dynamo_parsers::tool_calling::get_tool_call_section_markers(parser_name)
+                    {
+                        Box::pin(Self::relocate_tool_calls_from_reasoning(
+                            stream,
+                            section_start,
+                            section_end,
+                        ))
+                    } else {
+                        stream
+                    }
+                } else {
+                    stream
+                }
+            } else {
+                stream
+            };
 
         // Convert OpenAI tools to parser ToolDefinition format before applying jail
         let tool_definitions = request.inner.tools.as_ref().map(|tools| {
@@ -1371,5 +1502,183 @@ mod tests {
             None,
             Some(&args),
         ));
+    }
+
+    // -- relocate_tool_calls_from_reasoning tests --
+
+    use dynamo_async_openai::types::{
+        ChatChoiceStream, ChatCompletionStreamResponseDelta, Role,
+    };
+    use dynamo_runtime::protocols::annotated::Annotated;
+    use futures::StreamExt;
+
+    /// Helper to build an Annotated stream chunk with optional content and reasoning_content.
+    fn make_annotated_chunk(
+        content: Option<String>,
+        reasoning_content: Option<String>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        #[allow(deprecated)]
+        let choice = ChatChoiceStream {
+            index: 0,
+            delta: ChatCompletionStreamResponseDelta {
+                role: Some(Role::Assistant),
+                content,
+                tool_calls: None,
+                function_call: None,
+                refusal: None,
+                reasoning_content,
+            },
+            finish_reason: None,
+            stop_reason: None,
+            logprobs: None,
+        };
+
+        Annotated::from_data(NvCreateChatCompletionStreamResponse {
+            id: "test".to_string(),
+            choices: vec![choice],
+            created: 0,
+            model: "test".to_string(),
+            system_fingerprint: None,
+            object: "chat.completion.chunk".to_string(),
+            usage: None,
+            service_tier: None,
+            nvext: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_relocate_basic() {
+        // All reasoning chunks contain tool call tokens → should be moved to content
+        let chunks = vec![
+            make_annotated_chunk(None, Some("<|tool_calls_section_begin|>".into())),
+            make_annotated_chunk(None, Some("<|tool_call_begin|>functions.bash:0".into())),
+            make_annotated_chunk(None, Some("<|tool_calls_section_end|>".into())),
+        ];
+        let input = stream::iter(chunks);
+        let output: Vec<_> = OpenAIPreprocessor::relocate_tool_calls_from_reasoning(
+            input,
+            "<|tool_calls_section_begin|>".into(),
+            "<|tool_calls_section_end|>".into(),
+        )
+        .collect()
+        .await;
+
+        assert_eq!(output.len(), 3);
+        for item in &output {
+            let choice = &item.data.as_ref().unwrap().choices[0];
+            // Tool call tokens should be in content, not reasoning
+            assert!(choice.delta.content.is_some());
+            assert!(choice.delta.reasoning_content.is_none());
+        }
+
+        // Verify content values
+        assert_eq!(
+            output[0].data.as_ref().unwrap().choices[0].delta.content,
+            Some("<|tool_calls_section_begin|>".into())
+        );
+        assert_eq!(
+            output[1].data.as_ref().unwrap().choices[0].delta.content,
+            Some("<|tool_call_begin|>functions.bash:0".into())
+        );
+        assert_eq!(
+            output[2].data.as_ref().unwrap().choices[0].delta.content,
+            Some("<|tool_calls_section_end|>".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relocate_mixed_chunk() {
+        // A single reasoning chunk with thinking text followed by section start
+        let chunks = vec![
+            make_annotated_chunk(
+                None,
+                Some("I need to call bash<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0".into()),
+            ),
+            make_annotated_chunk(None, Some("<|tool_calls_section_end|>".into())),
+        ];
+        let input = stream::iter(chunks);
+        let output: Vec<_> = OpenAIPreprocessor::relocate_tool_calls_from_reasoning(
+            input,
+            "<|tool_calls_section_begin|>".into(),
+            "<|tool_calls_section_end|>".into(),
+        )
+        .collect()
+        .await;
+
+        assert_eq!(output.len(), 2);
+
+        // First chunk: reasoning text stays, tool call part moves to content
+        let c0 = &output[0].data.as_ref().unwrap().choices[0];
+        assert_eq!(c0.delta.reasoning_content, Some("I need to call bash".into()));
+        assert_eq!(
+            c0.delta.content,
+            Some("<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0".into())
+        );
+
+        // Second chunk: section end moves to content
+        let c1 = &output[1].data.as_ref().unwrap().choices[0];
+        assert!(c1.delta.reasoning_content.is_none());
+        assert_eq!(
+            c1.delta.content,
+            Some("<|tool_calls_section_end|>".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relocate_passthrough() {
+        // Reasoning chunks without tool call markers pass through unchanged
+        let chunks = vec![
+            make_annotated_chunk(None, Some("thinking about the problem...".into())),
+            make_annotated_chunk(None, Some("still thinking...".into())),
+        ];
+        let input = stream::iter(chunks);
+        let output: Vec<_> = OpenAIPreprocessor::relocate_tool_calls_from_reasoning(
+            input,
+            "<|tool_calls_section_begin|>".into(),
+            "<|tool_calls_section_end|>".into(),
+        )
+        .collect()
+        .await;
+
+        assert_eq!(output.len(), 2);
+        for item in &output {
+            let choice = &item.data.as_ref().unwrap().choices[0];
+            assert!(choice.delta.content.is_none());
+            assert!(choice.delta.reasoning_content.is_some());
+        }
+        assert_eq!(
+            output[0].data.as_ref().unwrap().choices[0].delta.reasoning_content,
+            Some("thinking about the problem...".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relocate_content_passthrough() {
+        // Chunks with content (not reasoning) should not be affected
+        let chunks = vec![
+            make_annotated_chunk(Some("Hello world".into()), None),
+            make_annotated_chunk(Some("<|tool_calls_section_begin|>".into()), None),
+        ];
+        let input = stream::iter(chunks);
+        let output: Vec<_> = OpenAIPreprocessor::relocate_tool_calls_from_reasoning(
+            input,
+            "<|tool_calls_section_begin|>".into(),
+            "<|tool_calls_section_end|>".into(),
+        )
+        .collect()
+        .await;
+
+        assert_eq!(output.len(), 2);
+        // Content stays as content, no reasoning_content is touched
+        assert_eq!(
+            output[0].data.as_ref().unwrap().choices[0].delta.content,
+            Some("Hello world".into())
+        );
+        assert!(output[0].data.as_ref().unwrap().choices[0].delta.reasoning_content.is_none());
+        assert_eq!(
+            output[1].data.as_ref().unwrap().choices[0].delta.content,
+            Some("<|tool_calls_section_begin|>".into())
+        );
+        assert!(output[1].data.as_ref().unwrap().choices[0].delta.reasoning_content.is_none());
     }
 }

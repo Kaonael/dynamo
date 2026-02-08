@@ -192,6 +192,22 @@ pub fn find_tool_call_end_position(chunk: &str, parser_str: Option<&str>) -> usi
         }
     }
 }
+/// Get the section-level start/end markers for a tool call parser by name.
+///
+/// Returns the first start token and first end token from the parser's config,
+/// which represent the outermost tool call section delimiters (e.g.,
+/// `<|tool_calls_section_begin|>` / `<|tool_calls_section_end|>` for kimi_k25).
+pub fn get_tool_call_section_markers(parser_name: &str) -> Option<(String, String)> {
+    let map = get_tool_parser_map();
+    let config = map.get(parser_name)?;
+    let starts = config.parser_config.tool_call_start_tokens();
+    let ends = config.parser_config.tool_call_end_tokens();
+    if starts.is_empty() || ends.is_empty() {
+        return None;
+    }
+    Some((starts[0].clone(), ends[0].clone()))
+}
+
 // Tests
 // cargo test postprocessor::tool_calling::parsers
 #[cfg(test)]
@@ -3157,5 +3173,20 @@ weather forecasting
         assert_eq!(name, "batch_process");
         assert!(args["items"].is_array());
         assert_eq!(args["items"], serde_json::json!([1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn test_get_tool_call_section_markers_kimi_k25() {
+        let result = get_tool_call_section_markers("kimi_k25");
+        assert!(result.is_some());
+        let (start, end) = result.unwrap();
+        assert_eq!(start, "<|tool_calls_section_begin|>");
+        assert_eq!(end, "<|tool_calls_section_end|>");
+    }
+
+    #[test]
+    fn test_get_tool_call_section_markers_unknown() {
+        let result = get_tool_call_section_markers("nonexistent_parser");
+        assert!(result.is_none());
     }
 }

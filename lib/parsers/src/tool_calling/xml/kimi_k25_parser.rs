@@ -5,7 +5,6 @@
 // https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/function_call/kimik2_detector.py
 
 use regex::Regex;
-use uuid::Uuid;
 
 use super::super::ToolDefinition;
 use super::super::config::KimiK25ParserConfig;
@@ -195,8 +194,13 @@ fn parse_section_block(
             }
         };
 
+        // Preserve the original function_id (e.g., "functions.bash:0") as the tool call ID.
+        // The chat template uses this ID in `<|tool_call_begin|>{{ id }}` and
+        // `## Return of {{ tool_call_id }}`, so the model must see its own native format
+        // in multi-turn conversations. Using a synthetic UUID like "call-{uuid}" causes
+        // garbled output because the model was trained with "functions.name:index" IDs.
         let tool_call = ToolCallResponse {
-            id: format!("call-{}", Uuid::new_v4()),
+            id: function_id.to_string(),
             tp: ToolCallType::Function,
             function: CalledFunction {
                 name: function_name,

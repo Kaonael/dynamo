@@ -19,7 +19,9 @@ use super::pythonic::{
 };
 use super::response::ToolCallResponse;
 use super::xml::{
-    detect_tool_call_start_xml, find_tool_call_end_position_xml, try_tool_call_parse_xml,
+    detect_tool_call_start_kimi_k25, detect_tool_call_start_xml,
+    find_tool_call_end_position_kimi_k25, find_tool_call_end_position_xml,
+    try_tool_call_parse_kimi_k25, try_tool_call_parse_xml,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -43,6 +45,7 @@ pub fn get_tool_parser_map() -> &'static HashMap<&'static str, ToolCallConfig> {
         map.insert("qwen3_coder", ToolCallConfig::qwen3_coder());
         map.insert("jamba", ToolCallConfig::jamba());
         map.insert("minimax_m2", ToolCallConfig::minimax_m2());
+        map.insert("kimi_k25", ToolCallConfig::kimi_k25());
         map.insert("default", ToolCallConfig::default());
         map.insert("nemotron_nano", ToolCallConfig::qwen3_coder()); // nemotron nano follows qwen3_coder format
         map
@@ -82,6 +85,11 @@ pub async fn try_tool_call_parse(
         }
         ParserConfig::Dsml(dsml_config) => {
             let (results, normal_content) = try_tool_call_parse_dsml(message, dsml_config)?;
+            Ok((results, normal_content))
+        }
+        ParserConfig::KimiK25(kimi_config) => {
+            let (results, normal_content) =
+                try_tool_call_parse_kimi_k25(message, kimi_config, tools)?;
             Ok((results, normal_content))
         }
     }
@@ -134,6 +142,9 @@ pub fn detect_tool_call_start(chunk: &str, parser_str: Option<&str>) -> anyhow::
             }
             ParserConfig::Xml(xml_config) => Ok(detect_tool_call_start_xml(chunk, xml_config)),
             ParserConfig::Dsml(dsml_config) => Ok(detect_tool_call_start_dsml(chunk, dsml_config)),
+            ParserConfig::KimiK25(kimi_config) => {
+                Ok(detect_tool_call_start_kimi_k25(chunk, kimi_config))
+            }
         },
         None => anyhow::bail!(
             "Parser '{}' is not implemented. Available parsers: {:?}",
@@ -171,6 +182,9 @@ pub fn find_tool_call_end_position(chunk: &str, parser_str: Option<&str>) -> usi
             }
             ParserConfig::Xml(xml_config) => find_tool_call_end_position_xml(chunk, xml_config),
             ParserConfig::Dsml(dsml_config) => find_tool_call_end_position_dsml(chunk, dsml_config),
+            ParserConfig::KimiK25(kimi_config) => {
+                find_tool_call_end_position_kimi_k25(chunk, kimi_config)
+            }
         },
         None => {
             // Unknown parser, return full content length
@@ -211,6 +225,7 @@ mod tests {
             "jamba",
             "nemotron_nano",
             "minimax_m2",
+            "kimi_k25",
         ];
         for parser in available_parsers {
             assert!(parsers.contains(&parser));

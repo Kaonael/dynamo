@@ -107,12 +107,21 @@ impl Default for DsmlParserConfig {
 /// <|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
 /// <|tool_calls_section_end|>
 /// ```
+///
+/// The model may emit either plural or singular forms of section tokens
+/// (e.g., `<|tool_calls_section_begin|>` or `<|tool_call_section_begin|>`).
+/// Both forms are supported via the `section_start_variants` and `section_end_variants` fields.
+/// See vllm `kimi_k2_tool_parser.py` for reference.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct KimiK25ParserConfig {
-    /// Start token for the tool calls section (e.g., "<|tool_calls_section_begin|>")
+    /// Primary start token for the tool calls section
     pub section_start: String,
-    /// End token for the tool calls section (e.g., "<|tool_calls_section_end|>")
+    /// Primary end token for the tool calls section
     pub section_end: String,
+    /// All recognized start tokens for the tool calls section (includes singular variants)
+    pub section_start_variants: Vec<String>,
+    /// All recognized end tokens for the tool calls section (includes singular variants)
+    pub section_end_variants: Vec<String>,
     /// Start token for an individual tool call (e.g., "<|tool_call_begin|>")
     pub call_start: String,
     /// End token for an individual tool call (e.g., "<|tool_call_end|>")
@@ -126,6 +135,14 @@ impl Default for KimiK25ParserConfig {
         Self {
             section_start: "<|tool_calls_section_begin|>".to_string(),
             section_end: "<|tool_calls_section_end|>".to_string(),
+            section_start_variants: vec![
+                "<|tool_calls_section_begin|>".to_string(),
+                "<|tool_call_section_begin|>".to_string(),
+            ],
+            section_end_variants: vec![
+                "<|tool_calls_section_end|>".to_string(),
+                "<|tool_call_section_end|>".to_string(),
+            ],
             call_start: "<|tool_call_begin|>".to_string(),
             call_end: "<|tool_call_end|>".to_string(),
             argument_begin: "<|tool_call_argument_begin|>".to_string(),
@@ -157,7 +174,7 @@ impl ParserConfig {
             ParserConfig::Pythonic => vec![],
             ParserConfig::Typescript => vec![],
             ParserConfig::Dsml(config) => vec![config.function_calls_start.clone()],
-            ParserConfig::KimiK25(config) => vec![config.section_start.clone()],
+            ParserConfig::KimiK25(config) => config.section_start_variants.clone(),
         }
     }
 
@@ -171,7 +188,7 @@ impl ParserConfig {
             ParserConfig::Pythonic => vec![],
             ParserConfig::Typescript => vec![],
             ParserConfig::Dsml(config) => vec![config.function_calls_end.clone()],
-            ParserConfig::KimiK25(config) => vec![config.section_end.clone()],
+            ParserConfig::KimiK25(config) => config.section_end_variants.clone(),
         }
     }
 }

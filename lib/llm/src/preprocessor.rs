@@ -1357,69 +1357,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_kimi_k25_reasoning_disabled_when_thinking_false() {
-        let mut args = std::collections::HashMap::new();
-        args.insert(
-            "thinking".to_string(),
-            serde_json::Value::Bool(false),
-        );
-        assert!(OpenAIPreprocessor::is_reasoning_disabled_by_request(
-            Some("kimi_k25"),
-            Some(&args),
-        ));
-    }
+    fn test_is_reasoning_disabled_by_request() {
+        let thinking_true = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("thinking".to_string(), serde_json::Value::Bool(true));
+            m
+        };
+        let thinking_false = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("thinking".to_string(), serde_json::Value::Bool(false));
+            m
+        };
+        let empty_args = std::collections::HashMap::new();
 
-    #[test]
-    fn test_kimi_k25_reasoning_enabled_when_thinking_true() {
-        let mut args = std::collections::HashMap::new();
-        args.insert(
-            "thinking".to_string(),
-            serde_json::Value::Bool(true),
-        );
-        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
-            Some("kimi_k25"),
-            Some(&args),
-        ));
-    }
+        // (parser, args, expected_disabled, description)
+        let cases = [
+            (
+                Some("kimi_k25"),
+                Some(&thinking_false),
+                true,
+                "kimi_k25 + thinking=false → disabled",
+            ),
+            (
+                Some("kimi_k25"),
+                Some(&thinking_true),
+                false,
+                "kimi_k25 + thinking=true → enabled",
+            ),
+            (
+                Some("kimi_k25"),
+                None,
+                false,
+                "kimi_k25 + no args → enabled",
+            ),
+            (
+                Some("kimi_k25"),
+                Some(&empty_args),
+                false,
+                "kimi_k25 + empty args → enabled",
+            ),
+            (
+                Some("deepseek_r1"),
+                Some(&thinking_false),
+                false,
+                "deepseek_r1 → never disabled",
+            ),
+            (
+                Some("basic"),
+                Some(&thinking_false),
+                false,
+                "basic → never disabled",
+            ),
+            (
+                None,
+                Some(&thinking_false),
+                false,
+                "no parser → never disabled",
+            ),
+        ];
 
-    #[test]
-    fn test_kimi_k25_reasoning_enabled_when_no_args() {
-        // Default: no chat_template_args → reasoning enabled
-        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
-            Some("kimi_k25"),
-            None,
-        ));
-    }
-
-    #[test]
-    fn test_kimi_k25_reasoning_enabled_when_empty_args() {
-        // Empty args (no "thinking" key) → reasoning enabled
-        let args = std::collections::HashMap::new();
-        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
-            Some("kimi_k25"),
-            Some(&args),
-        ));
-    }
-
-    #[test]
-    fn test_non_kimi_parser_never_disabled() {
-        let mut args = std::collections::HashMap::new();
-        args.insert(
-            "thinking".to_string(),
-            serde_json::Value::Bool(false),
-        );
-        // Other parsers should never be disabled by this check
-        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
-            Some("deepseek_r1"),
-            Some(&args),
-        ));
-        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
-            Some("basic"),
-            Some(&args),
-        ));
-        assert!(!OpenAIPreprocessor::is_reasoning_disabled_by_request(
-            None,
-            Some(&args),
-        ));
+        for (parser, args, expected, desc) in cases {
+            assert_eq!(
+                OpenAIPreprocessor::is_reasoning_disabled_by_request(parser, args),
+                expected,
+                "FAILED: {desc}",
+            );
+        }
     }
 }

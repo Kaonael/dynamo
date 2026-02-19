@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reasoning_parser_with_kimi_k25() {
+    async fn test_reasoning_parser_with_kimi_k2() {
         // (description, input_chunks, expected_reasoning, expected_content)
         let cases = vec![
             (
@@ -485,7 +485,7 @@ mod tests {
         ];
 
         for (desc, chunks, expected_reasoning, expected_content) in cases {
-            let (reasoning, content) = run_parser(chunks, "kimi_k25").await;
+            let (reasoning, content) = run_parser(chunks, "kimi_k2").await;
             assert_eq!(reasoning, expected_reasoning, "FAILED reasoning: {desc}");
             assert_eq!(content, expected_content, "FAILED content: {desc}");
         }

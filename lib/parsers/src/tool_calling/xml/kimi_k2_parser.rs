@@ -3,31 +3,24 @@
 
 // Reference implementation:
 // https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/function_call/kimik2_detector.py
+// https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/kimi_k2_tool_parser.py
 
 use std::sync::OnceLock;
 
 use regex::Regex;
 
 use super::super::ToolDefinition;
-use super::super::config::KimiK25ParserConfig;
+use super::super::config::KimiK2ParserConfig;
 use super::response::{CalledFunction, ToolCallResponse, ToolCallType};
 
 static ID_REGEX: OnceLock<Regex> = OnceLock::new();
 
-/// Build a regex to match individual tool calls from the given config.
-///
 /// The regex captures `function_id` (e.g. `functions.get_weather:0`) and `arguments` (JSON object)
 /// between the configured `call_start`, `argument_begin`, and `call_end` tokens.
 ///
 /// The `function_id` pattern `[\w.]+:\d+` matches the `functions.name:index` format used by
-/// Kimi K2.5, consistent with sglang/vllm reference implementations.
-///
-/// The `arguments` pattern `\{.*?\}` with `(?s)` relies on regex backtracking to handle nested
-/// JSON objects: the engine tries each `}` position until `\s*<call_end>` matches after it.
-/// This works because `call_end` is a unique token that cannot appear inside JSON. For
-/// deeply nested JSON, the regex engine backtracks from the first `}` until it finds the
-/// outermost closing brace followed by the end token.
-fn build_tool_call_regex(config: &KimiK25ParserConfig) -> Regex {
+/// Kimi K2, consistent with sglang/vllm reference implementations.
+fn build_tool_call_regex(config: &KimiK2ParserConfig) -> Regex {
     let pattern = format!(
         r"(?s){}\s*(?P<function_id>[\w.]+:\d+)\s*{}\s*(?P<arguments>\{{.*?\}})\s*{}",
         regex::escape(&config.call_start),
@@ -44,9 +37,9 @@ fn get_id_regex() -> &'static Regex {
     })
 }
 
-/// Check if a chunk contains the start of a Kimi K2.5-style tool call.
+/// Check if a chunk contains the start of a Kimi K2 style tool call.
 /// Detects `<|tool_calls_section_begin|>` (or singular variant) or partial match for streaming.
-pub fn detect_tool_call_start_kimi_k25(chunk: &str, config: &KimiK25ParserConfig) -> bool {
+pub fn detect_tool_call_start_kimi_k2(chunk: &str, config: &KimiK2ParserConfig) -> bool {
     for start_token in &config.section_start_variants {
         // Check for complete start token.
         if chunk.contains(start_token.as_str()) {
@@ -54,7 +47,7 @@ pub fn detect_tool_call_start_kimi_k25(chunk: &str, config: &KimiK25ParserConfig
         }
 
         // Check for partial match at the end of the chunk (for streaming).
-        // Note: byte slicing is safe here because Kimi K2.5 section tokens are ASCII-only.
+        // Note: byte slicing is safe here because Kimi K2 section tokens are ASCII-only.
         for i in 1..start_token.len() {
             if chunk.ends_with(&start_token[..i]) {
                 return true;
@@ -65,10 +58,9 @@ pub fn detect_tool_call_start_kimi_k25(chunk: &str, config: &KimiK25ParserConfig
     false
 }
 
-/// Find the end position of a Kimi K2.5 tool call section.
 /// Returns the position after `<|tool_calls_section_end|>` (or singular variant) or the length
 /// of the chunk if not found.
-pub fn find_tool_call_end_position_kimi_k25(chunk: &str, config: &KimiK25ParserConfig) -> usize {
+pub fn find_tool_call_end_position_kimi_k2(chunk: &str, config: &KimiK2ParserConfig) -> usize {
     // Find the earliest matching end token variant.
     let mut earliest: Option<usize> = None;
     for end_token in &config.section_end_variants {
@@ -80,8 +72,6 @@ pub fn find_tool_call_end_position_kimi_k25(chunk: &str, config: &KimiK25ParserC
     earliest.unwrap_or(chunk.len())
 }
 
-/// Try to parse Kimi K2.5 formatted tool calls from a message.
-///
 /// Format:
 /// ```text
 /// <|tool_calls_section_begin|>
@@ -90,9 +80,9 @@ pub fn find_tool_call_end_position_kimi_k25(chunk: &str, config: &KimiK25ParserC
 /// ```
 ///
 /// Returns (parsed_tool_calls, normal_text_content)
-pub fn try_tool_call_parse_kimi_k25(
+pub fn try_tool_call_parse_kimi_k2(
     message: &str,
-    config: &KimiK25ParserConfig,
+    config: &KimiK2ParserConfig,
     tools: Option<&[ToolDefinition]>,
 ) -> anyhow::Result<(Vec<ToolCallResponse>, Option<String>)> {
     let (normal_text, tool_calls) = extract_tool_calls(message, config, tools)?;
@@ -111,7 +101,7 @@ pub fn try_tool_call_parse_kimi_k25(
 fn find_section_start(
     text: &str,
     cursor: usize,
-    config: &KimiK25ParserConfig,
+    config: &KimiK2ParserConfig,
 ) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     for variant in &config.section_start_variants {
@@ -129,7 +119,7 @@ fn find_section_start(
 fn find_section_end(
     text: &str,
     from: usize,
-    config: &KimiK25ParserConfig,
+    config: &KimiK2ParserConfig,
 ) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     for variant in &config.section_end_variants {
@@ -145,7 +135,7 @@ fn find_section_end(
 /// Extract tool calls and normal text from message.
 fn extract_tool_calls(
     text: &str,
-    config: &KimiK25ParserConfig,
+    config: &KimiK2ParserConfig,
     tools: Option<&[ToolDefinition]>,
 ) -> anyhow::Result<(String, Vec<ToolCallResponse>)> {
     let mut normal_parts = Vec::new();
@@ -191,7 +181,7 @@ fn extract_tool_calls(
 /// Each individual call is between `<|tool_call_begin|>` and `<|tool_call_end|>`.
 fn parse_section_block(
     block: &str,
-    config: &KimiK25ParserConfig,
+    config: &KimiK2ParserConfig,
     tools: Option<&[ToolDefinition]>,
 ) -> anyhow::Result<Vec<ToolCallResponse>> {
     let tool_call_regex = build_tool_call_regex(config);
@@ -249,10 +239,6 @@ fn parse_section_block(
         };
 
         // Preserve the original function_id (e.g., "functions.bash:0") as the tool call ID.
-        // The chat template uses this ID in `<|tool_call_begin|>{{ id }}` and
-        // `## Return of {{ tool_call_id }}`, so the model must see its own native format
-        // in multi-turn conversations. Using a synthetic UUID like "call-{uuid}" causes
-        // garbled output because the model was trained with "functions.name:index" IDs.
         let tool_call = ToolCallResponse {
             id: function_id.to_string(),
             tp: ToolCallType::Function,
@@ -272,41 +258,41 @@ fn parse_section_block(
 mod tests {
     use super::*;
 
-    fn default_config() -> KimiK25ParserConfig {
-        KimiK25ParserConfig::default()
+    fn default_config() -> KimiK2ParserConfig {
+        KimiK2ParserConfig::default()
     }
 
     #[test]
     fn test_detect_tool_call_start() {
         let config = default_config();
-        assert!(detect_tool_call_start_kimi_k25(
+        assert!(detect_tool_call_start_kimi_k2(
             "<|tool_calls_section_begin|>",
             &config
         ));
-        assert!(detect_tool_call_start_kimi_k25(
+        assert!(detect_tool_call_start_kimi_k2(
             "text <|tool_calls_section_begin|>",
             &config
         ));
         // Partial match at end
-        assert!(detect_tool_call_start_kimi_k25("<|tool_calls_sec", &config));
-        assert!(detect_tool_call_start_kimi_k25("<|", &config));
+        assert!(detect_tool_call_start_kimi_k2("<|tool_calls_sec", &config));
+        assert!(detect_tool_call_start_kimi_k2("<|", &config));
         // No match
-        assert!(!detect_tool_call_start_kimi_k25(
+        assert!(!detect_tool_call_start_kimi_k2(
             "no tool call here",
             &config
         ));
-        assert!(!detect_tool_call_start_kimi_k25("toolcall", &config));
+        assert!(!detect_tool_call_start_kimi_k2("toolcall", &config));
     }
 
     #[test]
     fn test_find_tool_call_end_position() {
         let config = default_config();
         let text = "<|tool_calls_section_begin|><|tool_call_begin|>functions.test:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>more text";
-        let pos = find_tool_call_end_position_kimi_k25(text, &config);
+        let pos = find_tool_call_end_position_kimi_k2(text, &config);
         assert_eq!(&text[pos..], "more text");
 
         let text_no_end = "<|tool_calls_section_begin|><|tool_call_begin|>functions.test:0";
-        let pos = find_tool_call_end_position_kimi_k25(text_no_end, &config);
+        let pos = find_tool_call_end_position_kimi_k2(text_no_end, &config);
         assert_eq!(pos, text_no_end.len());
     }
 
@@ -315,7 +301,7 @@ mod tests {
         let config = default_config();
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(normal, Some("".to_string()));
@@ -329,7 +315,7 @@ mod tests {
         let config = default_config();
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"San Francisco, CA","unit":"fahrenheit"}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
 
@@ -343,7 +329,7 @@ mod tests {
         let config = default_config();
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|><|tool_call_begin|>functions.get_time:1<|tool_call_argument_begin|>{"timezone":"EST"}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(calls[1].function.name, "get_time");
@@ -360,7 +346,7 @@ mod tests {
         let config = default_config();
         let input = r#"I'll help you with that. <|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"Dallas"}<|tool_call_end|><|tool_calls_section_end|> Let me check."#;
 
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(
@@ -374,7 +360,7 @@ mod tests {
         let config = default_config();
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.get_current_time:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_current_time");
 
@@ -387,7 +373,7 @@ mod tests {
         let config = default_config();
         let input = "This is just normal text without any tool calls.";
 
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 0);
         assert_eq!(normal, Some(input.to_string()));
     }
@@ -398,7 +384,7 @@ mod tests {
         // Some models may emit without the "functions." prefix
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
     }
@@ -418,7 +404,7 @@ mod tests {
 
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, Some(&tools)).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, Some(&tools)).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
     }
@@ -429,7 +415,7 @@ mod tests {
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|>"#;
 
         // Should handle gracefully - section_end not found so whole text is treated as normal
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(
             calls.len(),
             0,
@@ -447,7 +433,7 @@ mod tests {
         let config = default_config();
         let input = "<|tool_calls_section_begin|>\n<|tool_call_begin|> functions.search:0 <|tool_call_argument_begin|> {\"query\":\"rust programming\"} <|tool_call_end|>\n<|tool_calls_section_end|>";
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "search");
 
@@ -460,7 +446,7 @@ mod tests {
         let config = default_config();
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.process_data:0<|tool_call_argument_begin|>{"items":[1,2,3],"config":{"nested":true}}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "process_data");
 
@@ -475,7 +461,7 @@ mod tests {
         // Multiple tool calls with deeply nested JSON - stress test for regex backtracking
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.create_config:0<|tool_call_argument_begin|>{"database":{"primary":{"host":"db1.example.com","port":5432,"options":{"ssl":true,"pool":{"min":5,"max":20}}},"replica":{"host":"db2.example.com","port":5432}},"features":["auth","logging"]}<|tool_call_end|><|tool_call_begin|>functions.deploy:1<|tool_call_argument_begin|>{"env":"production","services":[{"name":"api","replicas":3,"config":{"memory":"2Gi","cpu":"1000m"}},{"name":"worker","replicas":2,"config":{"memory":"4Gi","cpu":"2000m"}}]}<|tool_call_end|><|tool_call_begin|>functions.notify:2<|tool_call_argument_begin|>{"channels":["slack","email"],"message":"Deployment started"}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 3);
 
         assert_eq!(calls[0].function.name, "create_config");
@@ -500,12 +486,12 @@ mod tests {
     fn test_detect_singular_section_start() {
         let config = default_config();
         // Singular variant: <|tool_call_section_begin|> (without 's')
-        assert!(detect_tool_call_start_kimi_k25(
+        assert!(detect_tool_call_start_kimi_k2(
             "<|tool_call_section_begin|>",
             &config
         ));
         // Partial match of singular variant
-        assert!(detect_tool_call_start_kimi_k25(
+        assert!(detect_tool_call_start_kimi_k2(
             "text <|tool_call_section_b",
             &config
         ));
@@ -517,7 +503,7 @@ mod tests {
         // Use singular form: tool_call_section_begin/end (without 's')
         let input = r#"<|tool_call_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|><|tool_call_section_end|>"#;
 
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(normal, Some("".to_string()));
@@ -528,7 +514,7 @@ mod tests {
         let config = default_config();
         // Singular variant end token
         let text = "<|tool_call_section_begin|><|tool_call_begin|>functions.test:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_call_section_end|>more text";
-        let pos = find_tool_call_end_position_kimi_k25(text, &config);
+        let pos = find_tool_call_end_position_kimi_k2(text, &config);
         assert_eq!(&text[pos..], "more text");
     }
 
@@ -541,7 +527,7 @@ mod tests {
         let config = default_config();
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{invalid json here}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
         // Arguments should be preserved as raw string since JSON parsing failed
@@ -557,22 +543,22 @@ mod tests {
 
         // No colon+digit suffix at all
         let input1 = r#"<|tool_calls_section_begin|><|tool_call_begin|>just_a_name<|tool_call_argument_begin|>{"key":"val"}<|tool_call_end|><|tool_calls_section_end|>"#;
-        let (calls, _) = try_tool_call_parse_kimi_k25(input1, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input1, &config, None).unwrap();
         assert_eq!(calls.len(), 0, "ID without :digit should be rejected");
 
         // Colon but non-digit suffix
         let input2 = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:abc<|tool_call_argument_begin|>{"key":"val"}<|tool_call_end|><|tool_calls_section_end|>"#;
-        let (calls, _) = try_tool_call_parse_kimi_k25(input2, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input2, &config, None).unwrap();
         assert_eq!(calls.len(), 0, "ID with :non-digit should be rejected");
 
         // Multiple colons (garbage)
         let input3 = r#"<|tool_calls_section_begin|><|tool_call_begin|>:::0<|tool_call_argument_begin|>{"key":"val"}<|tool_call_end|><|tool_calls_section_end|>"#;
-        let (calls, _) = try_tool_call_parse_kimi_k25(input3, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input3, &config, None).unwrap();
         assert_eq!(calls.len(), 0, "Garbage ID should be rejected");
 
         // Valid call mixed with invalid — only valid should be extracted
         let input4 = r#"<|tool_calls_section_begin|><|tool_call_begin|>no_colon<|tool_call_argument_begin|>{"a":"b"}<|tool_call_end|><|tool_call_begin|>functions.valid:0<|tool_call_argument_begin|>{"x":"y"}<|tool_call_end|><|tool_calls_section_end|>"#;
-        let (calls, _) = try_tool_call_parse_kimi_k25(input4, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input4, &config, None).unwrap();
         assert_eq!(calls.len(), 1, "Only valid call should be extracted");
         assert_eq!(calls[0].function.name, "valid");
     }
@@ -585,7 +571,7 @@ mod tests {
         let config = default_config();
         let input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.render_html:0<|tool_call_argument_begin|>{"template":"<div class=\"main\"><h1>Title</h1><p>Content</p></div>","format":"html"}<|tool_call_end|><|tool_calls_section_end|>"#;
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "render_html");
 
@@ -606,7 +592,7 @@ mod tests {
             <|tool_call_begin|>functions.search:2<|tool_call_argument_begin|>{\"q\":\"go\"}<|tool_call_end|>\
             <|tool_calls_section_end|>";
 
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].function.name, "search");
         assert_eq!(calls[0].id, "functions.search:0");
@@ -631,7 +617,7 @@ mod tests {
         let config = default_config();
         let input = "<|tool_calls_section_begin|><|tool_call_begin|>functions.create_user:0<|tool_call_argument_begin|>{\n  \"name\": \"John Doe\",\n  \"address\": {\n    \"street\": \"123 Main St\",\n    \"city\": \"Springfield\"\n  },\n  \"tags\": [\n    \"admin\",\n    \"active\"\n  ]\n}<|tool_call_end|><|tool_calls_section_end|>";
 
-        let (calls, _) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, _) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "create_user");
 
@@ -648,7 +634,7 @@ mod tests {
         let config = default_config();
         let input = "Here is my answer. <|tool_calls_section_begin|><|tool_calls_section_end|> And more text.";
 
-        let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
+        let (calls, normal) = try_tool_call_parse_kimi_k2(input, &config, None).unwrap();
         assert_eq!(calls.len(), 0, "Empty section should produce no tool calls");
         assert_eq!(
             normal,

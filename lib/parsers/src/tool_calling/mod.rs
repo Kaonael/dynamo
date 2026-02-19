@@ -24,7 +24,7 @@ pub struct ToolDefinition {
 
 // Re-export main types and functions for convenience
 pub use config::{
-    JsonParserConfig, KimiK25ParserConfig, ParserConfig, ToolCallConfig, XmlParserConfig,
+    JsonParserConfig, KimiK2ParserConfig, ParserConfig, ToolCallConfig, XmlParserConfig,
 };
 pub use dsml::try_tool_call_parse_dsml;
 pub use harmony::parse_tool_calls_harmony_complete;
@@ -36,5 +36,5 @@ pub use parsers::{
 pub use pythonic::try_tool_call_parse_pythonic;
 pub use response::{CalledFunction, ToolCallResponse, ToolCallType};
 pub use tools::{try_tool_call_parse_aggregate, try_tool_call_parse_stream};
-pub use xml::try_tool_call_parse_kimi_k25;
+pub use xml::try_tool_call_parse_kimi_k2;
 pub use xml::try_tool_call_parse_xml;

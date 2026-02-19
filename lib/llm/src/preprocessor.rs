@@ -946,13 +946,13 @@ impl OpenAIPreprocessor {
     }
 
     /// Check if reasoning parsing should be disabled based on per-request parameters.
-    /// For kimi_k25: disabled when chat_template_args contains "thinking": false.
+    /// For kimi_k2: disabled when chat_template_args contains "thinking": false.
     fn is_reasoning_disabled_by_request(
         reasoning_parser: Option<&str>,
         chat_template_args: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> bool {
         match reasoning_parser {
-            Some("kimi_k25") => {
+            Some("kimi_k2") => {
                 if let Some(args) = chat_template_args {
                     if let Some(thinking) = args.get("thinking") {
                         return thinking == &serde_json::Value::Bool(false);
@@ -1373,28 +1373,23 @@ mod tests {
         // (parser, args, expected_disabled, description)
         let cases = [
             (
-                Some("kimi_k25"),
+                Some("kimi_k2"),
                 Some(&thinking_false),
                 true,
-                "kimi_k25 + thinking=false → disabled",
+                "kimi_k2 + thinking=false → disabled",
             ),
             (
-                Some("kimi_k25"),
+                Some("kimi_k2"),
                 Some(&thinking_true),
                 false,
-                "kimi_k25 + thinking=true → enabled",
+                "kimi_k2 + thinking=true → enabled",
             ),
+            (Some("kimi_k2"), None, false, "kimi_k2 + no args → enabled"),
             (
-                Some("kimi_k25"),
-                None,
-                false,
-                "kimi_k25 + no args → enabled",
-            ),
-            (
-                Some("kimi_k25"),
+                Some("kimi_k2"),
                 Some(&empty_args),
                 false,
-                "kimi_k25 + empty args → enabled",
+                "kimi_k2 + empty args → enabled",
             ),
             (
                 Some("deepseek_r1"),

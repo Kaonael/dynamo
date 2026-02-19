@@ -108,7 +108,11 @@ pub fn try_tool_call_parse_kimi_k25(
 
 /// Find the first occurrence of any section start variant in `text[cursor..]`.
 /// Returns `(relative_position, matched_token_length)` or `None`.
-fn find_section_start(text: &str, cursor: usize, config: &KimiK25ParserConfig) -> Option<(usize, usize)> {
+fn find_section_start(
+    text: &str,
+    cursor: usize,
+    config: &KimiK25ParserConfig,
+) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     for variant in &config.section_start_variants {
         if let Some(pos) = text[cursor..].find(variant.as_str()) {
@@ -122,7 +126,11 @@ fn find_section_start(text: &str, cursor: usize, config: &KimiK25ParserConfig) -
 
 /// Find the first occurrence of any section end variant in `text[from..]`.
 /// Returns `(relative_position, matched_token_length)` or `None`.
-fn find_section_end(text: &str, from: usize, config: &KimiK25ParserConfig) -> Option<(usize, usize)> {
+fn find_section_end(
+    text: &str,
+    from: usize,
+    config: &KimiK25ParserConfig,
+) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     for variant in &config.section_end_variants {
         if let Some(pos) = text[from..].find(variant.as_str()) {
@@ -223,10 +231,7 @@ fn parse_section_block(
         // Validate function name against tools if provided
         if let Some(tools) = tools {
             if !tools.iter().any(|t| t.name == function_name) {
-                tracing::warn!(
-                    "Tool '{}' is not defined in the tools list.",
-                    function_name
-                );
+                tracing::warn!("Tool '{}' is not defined in the tools list.", function_name);
             }
         }
 
@@ -344,10 +349,8 @@ mod tests {
         assert_eq!(calls[1].function.name, "get_time");
         assert_eq!(normal, Some("".to_string()));
 
-        let args0: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
-        let args1: serde_json::Value =
-            serde_json::from_str(&calls[1].function.arguments).unwrap();
+        let args0: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args1: serde_json::Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
         assert_eq!(args0["location"], "NYC");
         assert_eq!(args1["timezone"], "EST");
     }
@@ -427,8 +430,16 @@ mod tests {
 
         // Should handle gracefully - section_end not found so whole text is treated as normal
         let (calls, normal) = try_tool_call_parse_kimi_k25(input, &config, None).unwrap();
-        assert_eq!(calls.len(), 0, "No tool calls should be parsed without section end");
-        assert_eq!(normal, Some(input.to_string()), "Input should be preserved as normal text");
+        assert_eq!(
+            calls.len(),
+            0,
+            "No tool calls should be parsed without section end"
+        );
+        assert_eq!(
+            normal,
+            Some(input.to_string()),
+            "Input should be preserved as normal text"
+        );
     }
 
     #[test]

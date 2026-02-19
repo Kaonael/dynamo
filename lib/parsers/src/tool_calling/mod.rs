@@ -23,7 +23,9 @@ pub struct ToolDefinition {
 }
 
 // Re-export main types and functions for convenience
-pub use config::{JsonParserConfig, KimiK25ParserConfig, ParserConfig, ToolCallConfig, XmlParserConfig};
+pub use config::{
+    JsonParserConfig, KimiK25ParserConfig, ParserConfig, ToolCallConfig, XmlParserConfig,
+};
 pub use dsml::try_tool_call_parse_dsml;
 pub use harmony::parse_tool_calls_harmony_complete;
 pub use json::try_tool_call_parse_json;

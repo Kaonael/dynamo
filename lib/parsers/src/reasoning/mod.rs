@@ -244,44 +244,44 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_k25_parser_is_force_reasoning() {
-        // KimiK25 uses force_reasoning=true: output without <think> tags is still treated as reasoning
-        let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
-        let result = parser.detect_and_parse_reasoning("no think tags here", &[]);
-        assert_eq!(result.reasoning_text, "no think tags here");
-        assert_eq!(result.normal_text, "");
-    }
+    fn test_kimi_k25_detect_and_parse() {
+        // (description, input, expected_reasoning, expected_normal)
+        let cases = [
+            (
+                "force reasoning: no think tags",
+                "no think tags here",
+                "no think tags here",
+                "",
+            ),
+            (
+                "standard think tags",
+                "<think>Let me reason about this.</think>Hello!",
+                "Let me reason about this.",
+                "Hello!",
+            ),
+            (
+                "empty think block (instant mode)",
+                "<think></think>Hello from instant mode!",
+                "",
+                "Hello from instant mode!",
+            ),
+            (
+                "empty think block with newline",
+                "<think>\n</think>Hello from instant mode!",
+                "",
+                "Hello from instant mode!",
+            ),
+        ];
 
-    #[test]
-    fn test_kimi_k25_parser_with_think_tags() {
-        // KimiK25 default: model generates <think>...</think> then content
-        let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
-        let result = parser.detect_and_parse_reasoning(
-            "<think>Let me reason about this.</think>Hello!",
-            &[],
-        );
-        assert_eq!(result.reasoning_text, "Let me reason about this.");
-        assert_eq!(result.normal_text, "Hello!");
-    }
-
-    #[test]
-    fn test_kimi_k25_parser_empty_think_block() {
-        // Instant mode: model generates <think></think> then content (thinking disabled)
-        let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
-        let result =
-            parser.detect_and_parse_reasoning("<think></think>Hello from instant mode!", &[]);
-        assert_eq!(result.reasoning_text, "");
-        assert_eq!(result.normal_text, "Hello from instant mode!");
-    }
-
-    #[test]
-    fn test_kimi_k25_parser_empty_think_block_with_newline() {
-        // Some models emit <think>\n</think> in instant mode
-        let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
-        let result =
-            parser.detect_and_parse_reasoning("<think>\n</think>Hello from instant mode!", &[]);
-        assert_eq!(result.reasoning_text, "");
-        assert_eq!(result.normal_text, "Hello from instant mode!");
+        for (desc, input, expected_reasoning, expected_normal) in cases {
+            let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
+            let result = parser.detect_and_parse_reasoning(input, &[]);
+            assert_eq!(
+                result.reasoning_text, expected_reasoning,
+                "FAILED reasoning: {desc}"
+            );
+            assert_eq!(result.normal_text, expected_normal, "FAILED normal: {desc}");
+        }
     }
 
     #[test]
@@ -306,57 +306,53 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_k25_streaming_complete_response() {
-        // Streaming token-by-token through a full KimiK25 response
-        let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
-        let mut all_reasoning = String::new();
-        let mut all_content = String::new();
-
-        let tokens = [
-            "<think>",
-            "I need to",
-            " think about",
-            " this carefully.",
-            "</think>",
-            "Bonjour",
-            "!",
+    fn test_kimi_k25_streaming() {
+        // (description, tokens, expected_reasoning, expected_content)
+        let cases: Vec<(&str, &[&str], &str, &str)> = vec![
+            (
+                "complete response",
+                &[
+                    "<think>",
+                    "I need to",
+                    " think about",
+                    " this carefully.",
+                    "</think>",
+                    "Bonjour",
+                    "!",
+                ],
+                "I need to think about this carefully.",
+                "Bonjour!",
+            ),
+            (
+                "empty think (instant mode)",
+                &["<think>", "</think>", "Direct answer."],
+                "",
+                "Direct answer.",
+            ),
         ];
-        for token in tokens {
-            let r = parser.parse_reasoning_streaming_incremental(token, &[]);
-            all_reasoning.push_str(&r.reasoning_text);
-            all_content.push_str(&r.normal_text);
+
+        for (desc, tokens, expected_reasoning, expected_content) in cases {
+            let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
+            let mut all_reasoning = String::new();
+            let mut all_content = String::new();
+            for token in tokens {
+                let r = parser.parse_reasoning_streaming_incremental(token, &[]);
+                all_reasoning.push_str(&r.reasoning_text);
+                all_content.push_str(&r.normal_text);
+            }
+            assert_eq!(
+                all_reasoning, expected_reasoning,
+                "FAILED reasoning: {desc}"
+            );
+            assert_eq!(all_content, expected_content, "FAILED content: {desc}");
         }
-
-        assert_eq!(all_reasoning, "I need to think about this carefully.");
-        assert_eq!(all_content, "Bonjour!");
-    }
-
-    #[test]
-    fn test_kimi_k25_streaming_empty_think_instant_mode() {
-        // Streaming: instant mode produces <think></think> then content
-        let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
-        let mut all_reasoning = String::new();
-        let mut all_content = String::new();
-
-        let tokens = ["<think>", "</think>", "Direct answer."];
-        for token in tokens {
-            let r = parser.parse_reasoning_streaming_incremental(token, &[]);
-            all_reasoning.push_str(&r.reasoning_text);
-            all_content.push_str(&r.normal_text);
-        }
-
-        assert_eq!(all_reasoning, "");
-        assert_eq!(all_content, "Direct answer.");
     }
 
     #[test]
     fn test_kimi_k25_parser_lookup_by_name() {
         // Verify the parser can be looked up by name
         let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k25");
-        let result = parser.detect_and_parse_reasoning(
-            "<think>thinking</think>answer",
-            &[],
-        );
+        let result = parser.detect_and_parse_reasoning("<think>thinking</think>answer", &[]);
         assert_eq!(result.reasoning_text, "thinking");
         assert_eq!(result.normal_text, "answer");
     }

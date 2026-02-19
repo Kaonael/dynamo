@@ -26,7 +26,7 @@ fn get_reasoning_parser_map() -> &'static HashMap<&'static str, ReasoningParserT
         map.insert("qwen3", ReasoningParserType::Qwen);
         map.insert("nemotron_deci", ReasoningParserType::NemotronDeci);
         map.insert("kimi", ReasoningParserType::Kimi);
-        map.insert("kimi_k2", ReasoningParserType::KimiK2);
+        map.insert("kimi_k25", ReasoningParserType::KimiK25);
         map.insert("step3", ReasoningParserType::Step3);
         map.insert("mistral", ReasoningParserType::Mistral);
         map.insert("granite", ReasoningParserType::Granite);
@@ -97,7 +97,7 @@ pub enum ReasoningParserType {
     Qwen,
     NemotronDeci,
     Kimi,
-    KimiK2,
+    KimiK25,
     Mistral,
     Granite,
     MiniMaxAppendThink,
@@ -153,7 +153,7 @@ impl ReasoningParserType {
                     true,
                 )),
             },
-            ReasoningParserType::KimiK2 => ReasoningParserWrapper {
+            ReasoningParserType::KimiK25 => ReasoningParserWrapper {
                 parser: Box::new(BasicReasoningParser::new(
                     "<think>".into(),
                     "</think>".into(),
@@ -231,7 +231,7 @@ mod tests {
             "qwen3",
             "nemotron_deci",
             "kimi",
-            "kimi_k2",
+            "kimi_k25",
             "step3",
             "mistral",
             "granite",
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_k2_detect_and_parse() {
+    fn test_kimi_k25_detect_and_parse() {
         // (description, input, expected_reasoning, expected_normal)
         let cases = [
             (
@@ -274,7 +274,7 @@ mod tests {
         ];
 
         for (desc, input, expected_reasoning, expected_normal) in cases {
-            let mut parser = ReasoningParserType::KimiK2.get_reasoning_parser();
+            let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
             let result = parser.detect_and_parse_reasoning(input, &[]);
             assert_eq!(
                 result.reasoning_text, expected_reasoning,
@@ -285,9 +285,9 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_k2_streaming_force_reasoning() {
+    fn test_kimi_k25_streaming_force_reasoning() {
         // Streaming: force_reasoning means tokens before <think> are treated as reasoning
-        let mut parser = ReasoningParserType::KimiK2.get_reasoning_parser();
+        let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
 
         // First chunk: partial think tag — buffered because it's a prefix of "<think>"
         let r1 = parser.parse_reasoning_streaming_incremental("<thi", &[]);
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_k2_streaming() {
+    fn test_kimi_k25_streaming() {
         // (description, tokens, expected_reasoning, expected_content)
         let cases: Vec<(&str, &[&str], &str, &str)> = vec![
             (
@@ -332,7 +332,7 @@ mod tests {
         ];
 
         for (desc, tokens, expected_reasoning, expected_content) in cases {
-            let mut parser = ReasoningParserType::KimiK2.get_reasoning_parser();
+            let mut parser = ReasoningParserType::KimiK25.get_reasoning_parser();
             let mut all_reasoning = String::new();
             let mut all_content = String::new();
             for token in tokens {
@@ -349,27 +349,27 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_k2_parser_lookup_by_name() {
+    fn test_kimi_k25_parser_lookup_by_name() {
         // Verify the parser can be looked up by name
-        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k2");
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k25");
         let result = parser.detect_and_parse_reasoning("<think>thinking</think>answer", &[]);
         assert_eq!(result.reasoning_text, "thinking");
         assert_eq!(result.normal_text, "answer");
     }
 
     #[test]
-    fn test_kimi_vs_kimi_k2_different_tags() {
-        // Kimi (original) uses ◁think▷/◁/think▷, KimiK2 uses <think>/</think>
+    fn test_kimi_vs_kimi_k25_different_tags() {
+        // Kimi (original) uses ◁think▷/◁/think▷, KimiK25 uses <think>/</think>
         let mut kimi = ReasoningParserType::Kimi.get_reasoning_parser();
-        let mut kimi_k2 = ReasoningParserType::KimiK2.get_reasoning_parser();
+        let mut kimi_k25 = ReasoningParserType::KimiK25.get_reasoning_parser();
 
         // Kimi original does NOT parse <think> tags
         let r_kimi = kimi.detect_and_parse_reasoning("<think>reasoning</think>answer", &[]);
         assert_eq!(r_kimi.normal_text, "<think>reasoning</think>answer");
         assert_eq!(r_kimi.reasoning_text, "");
 
-        // KimiK2 does parse <think> tags
-        let r_k25 = kimi_k2.detect_and_parse_reasoning("<think>reasoning</think>answer", &[]);
+        // KimiK25 does parse <think> tags
+        let r_k25 = kimi_k25.detect_and_parse_reasoning("<think>reasoning</think>answer", &[]);
         assert_eq!(r_k25.reasoning_text, "reasoning");
         assert_eq!(r_k25.normal_text, "answer");
     }

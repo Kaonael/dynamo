@@ -124,7 +124,8 @@ where
 /// The file extension is used to determine the tokenizer type.
 /// Supported file types are:
 /// - json: HuggingFace tokenizer
-/// - model, tiktoken: tiktoken BPE tokenizer
+/// - model, tiktoken: tiktoken BPE tokenizer (requires `config.json` with a supported
+///   `model_type` in the same directory; currently: kimi, kimi_k2, kimi_k25)
 pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
     let path = Path::new(file_path);
     let extension = path

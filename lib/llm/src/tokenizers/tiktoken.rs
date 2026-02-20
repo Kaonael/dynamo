@@ -62,7 +62,8 @@ impl TikTokenTokenizer {
 
         let pattern = detect_bpe_pattern(directory)?;
         let encoder = parse_tiktoken_file(path)?;
-        let num_base_tokens = encoder.len();
+        // Use max rank + 1 (not len) to avoid ID collisions with sparse/non-contiguous ranks
+        let num_base_tokens = encoder.values().max().map_or(0, |&m| m + 1) as usize;
         let special_tokens = load_special_tokens(directory, num_base_tokens)?;
         let special_token_ids: HashSet<u32> = special_tokens.values().copied().collect();
 
@@ -150,8 +151,11 @@ fn detect_bpe_pattern(directory: &Path) -> Result<&'static str> {
     match model_type.as_str() {
         "kimi" | "kimi_k2" | "kimi_k25" => Ok(KIMI_PATTERN),
         _ => Err(Error::msg(format!(
-            "Unknown tiktoken BPE pattern for model_type: {model_type}. \
-             Please add support for this model type or provide a tokenizer.json file."
+            "Unsupported tiktoken model_type '{model_type}'. \
+             Currently supported: kimi, kimi_k2, kimi_k25. \
+             To add a new model type, extend detect_bpe_pattern() in tokenizers/tiktoken.rs \
+             with the appropriate BPE regex pattern. \
+             Alternatively, provide a tokenizer.json (HuggingFace format) instead."
         ))),
     }
 }

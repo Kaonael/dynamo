@@ -26,8 +26,9 @@ fn get_cached_model_path(model_name: &str, ignore_weights: bool) -> Option<PathB
     let config_path = repo.get("config.json")?;
 
     // Check for tokenizer files (at least one must exist)
-    let has_tokenizer =
-        repo.get("tokenizer.json").is_some() || repo.get("tokenizer_config.json").is_some();
+    let has_tokenizer = repo.get("tokenizer.json").is_some()
+        || repo.get("tokenizer_config.json").is_some()
+        || repo.get("tiktoken.model").is_some();
 
     if !has_tokenizer {
         return None;

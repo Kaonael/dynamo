@@ -45,9 +45,14 @@ This starts an OpenAI-compatible HTTP server with integrated pre/post processing
 
 The frontend does the pre and post processing. To do this it will need access to the model configuration files: `config.json`, `tokenizer.json`, `tokenizer_config.json`, etc. It does not need the weights.
 
-Frontend will download the files it needs from Hugging Face, no setup is required. However we recommend setting up [modelexpress-server](https://github.com/ai-dynamo/modelexpress) and a shared folder such as a Kubernetes PVC. This ensures the model is only downloaded once across the whole cluster.
+The frontend automatically obtains these files using the following priority chain:
 
-If the model is not available on Hugging Face, such as a private or customized model, you will need to make the model files available locally at the same file path as on the backend. The backend's `--model-path <here>` will need to exist on the frontend and contain at least the configuration (JSON) files.
+1. **Local HF cache** — if files are already cached locally, no network calls are made.
+2. **ModelExpress server** — downloads from [modelexpress-server](https://github.com/ai-dynamo/modelexpress) if configured. We recommend setting up ModelExpress with a shared folder (e.g. a Kubernetes PVC) so the model is only downloaded once across the cluster.
+3. **P2P from workers** — the frontend downloads config files directly from any available worker over the request plane (HTTP, TCP, or NATS). Workers automatically register a `model-config` endpoint alongside their inference endpoints. This requires no additional setup and works with any transport mode.
+4. **Direct HuggingFace download** — last resort fallback.
+
+For **private or customized models** that are not on HuggingFace, P2P delivery (step 3) enables the frontend to obtain config files automatically from the worker that has them locally. No shared filesystem or manual file copying is required — the worker serves the files on demand.
 
 ### KServe gRPC Frontend
 

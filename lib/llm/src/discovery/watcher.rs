@@ -411,7 +411,12 @@ impl ModelWatcher {
         mcid: &ModelCardInstanceId,
         card: &mut ModelDeploymentCard,
     ) -> anyhow::Result<()> {
-        card.download_config().await?;
+        // P2P downloader passed into download_config for the cache → ME → P2P → HF chain
+        let p2p = WatcherP2pDownloader {
+            drt: &self.drt,
+            mcid,
+        };
+        card.download_config(Some(&p2p)).await?;
 
         let component = self
             .drt
@@ -820,6 +825,108 @@ impl ModelWatcher {
             matches_name && matches_namespace
         });
         Ok(all)
+    }
+}
+
+/// P2P config downloader that uses the model-config endpoint via PushRouter.
+struct WatcherP2pDownloader<'a> {
+    drt: &'a DistributedRuntime,
+    mcid: &'a ModelCardInstanceId,
+}
+
+#[dynamo_runtime::pipeline::async_trait]
+impl crate::config_endpoint::P2pConfigDownloader for WatcherP2pDownloader<'_> {
+    async fn download(
+        &self,
+        card: &mut crate::model_card::ModelDeploymentCard,
+    ) -> anyhow::Result<()> {
+        use crate::config_endpoint::{
+            MODEL_CONFIG_ENDPOINT, ModelConfigRequest, ModelConfigResponse, p2p_cache_dir,
+        };
+
+        let component = self
+            .drt
+            .namespace(&self.mcid.namespace)?
+            .component(&self.mcid.component)?;
+
+        let config_endpoint = component.endpoint(MODEL_CONFIG_ENDPOINT);
+        let config_client = config_endpoint.client().await?;
+
+        // Old workers without model-config endpoint will timeout here.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            config_client.wait_for_instances(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("No model-config endpoint found (timeout)"))??;
+
+        let router =
+            PushRouter::<ModelConfigRequest, Annotated<ModelConfigResponse>>::from_client(
+                config_client,
+                Default::default(),
+            )
+            .await?;
+
+        let cache_dir = p2p_cache_dir(card.source_path());
+        tokio::fs::create_dir_all(&cache_dir).await?;
+
+        let filenames = card.config_filenames();
+        tracing::debug!("P2P: requesting {} config files from worker", filenames.len());
+
+        // Download all files in parallel
+        let download_futures: Vec<_> = filenames
+            .iter()
+            .map(|filename| {
+                let router = &router;
+                let cache_dir = &cache_dir;
+                async move {
+                    let req = ModelConfigRequest {
+                        filename: filename.clone(),
+                    };
+                    let mut stream = router.random(req.into()).await?;
+                    match stream.next().await {
+                        Some(annotated) => {
+                            // Check for worker-side errors before accessing data
+                            if let Some(ref err) = annotated.error {
+                                anyhow::bail!(
+                                    "Worker returned error for {filename}: {err}"
+                                );
+                            }
+                            if let Some(resp) = annotated.data {
+                                // Atomic write: temp file + rename to avoid corruption
+                                // from concurrent downloads of the same model
+                                let target = cache_dir.join(filename);
+                                let temp = target.with_extension(format!(
+                                    "tmp.{}",
+                                    uuid::Uuid::new_v4()
+                                ));
+                                tokio::fs::write(&temp, resp.0.as_bytes()).await?;
+                                if let Err(e) = tokio::fs::rename(&temp, &target).await {
+                                    let _ = tokio::fs::remove_file(&temp).await;
+                                    return Err(e.into());
+                                }
+                                tracing::debug!(
+                                    "P2P: downloaded {filename} ({} bytes)",
+                                    resp.0.len()
+                                );
+                            }
+                        }
+                        None => {
+                            tracing::debug!("P2P: {filename} not available, skipping");
+                        }
+                    }
+                    anyhow::Ok(())
+                }
+            })
+            .collect();
+        futures::future::try_join_all(download_futures).await?;
+
+        card.update_dir(&cache_dir);
+        if !card.has_local_files() {
+            anyhow::bail!("P2P download incomplete: some required config files missing");
+        }
+        card.verify_local_checksums()?;
+        Ok(())
     }
 }
 

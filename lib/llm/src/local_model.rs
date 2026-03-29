@@ -470,6 +470,36 @@ impl LocalModel {
                 .context("move_to_url")?;
         }
 
+        // Register model-config endpoint for P2P config file delivery.
+        {
+            use crate::config_endpoint::{
+                MODEL_CONFIG_ENDPOINT, ModelConfigEngine, ModelConfigRequest, ModelConfigResponse,
+            };
+            use dynamo_runtime::pipeline::{ManyOut, SingleIn, network::Ingress};
+            use dynamo_runtime::protocols::annotated::Annotated;
+            use std::sync::Arc;
+
+            let config_engine = Arc::new(ModelConfigEngine::new(self.full_path.clone()));
+            let config_ingress = Ingress::<
+                SingleIn<ModelConfigRequest>,
+                ManyOut<Annotated<ModelConfigResponse>>,
+            >::for_engine(config_engine)?;
+
+            let config_ep = endpoint.component().endpoint(MODEL_CONFIG_ENDPOINT);
+            let cancel = endpoint.drt().primary_token().clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    result = config_ep.endpoint_builder().handler(config_ingress).start() => {
+                        if let Err(e) = result {
+                            // Expected for duplicate registration (LoRA adapters)
+                            tracing::debug!("model-config endpoint stopped: {e}");
+                        }
+                    }
+                    _ = cancel.cancelled() => {}
+                }
+            });
+        }
+
         // Register the Model Deployment Card via discovery interface
         // The model_suffix (for LoRA) will be appended AFTER the instance_id
         let discovery = endpoint.drt().discovery();

@@ -105,27 +105,27 @@ impl CheckedFile {
         }
     }
 
-    /// Keep the filename but change it's containing directory to `dir`.
+    /// Extract just the filename from the path or URL.
+    pub fn filename(&self) -> Option<String> {
+        match self.path.as_ref() {
+            Either::Left(path) => path.file_name().and_then(|f| f.to_str()).map(String::from),
+            Either::Right(url) => url
+                .path()
+                .split('/')
+                .next_back()
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        }
+    }
+
+    /// Keep the filename but change its containing directory to `dir`.
     /// This is used to point at a model file (e.g. `tokenizer.json`) in the HF cache dir.
     pub fn update_dir(&mut self, dir: &Path) {
-        match self.path.as_mut() {
-            Either::Left(path) => {
-                if let Some(file_name) = path.file_name() {
-                    let mut new_path = PathBuf::from(dir);
-                    new_path.push(file_name);
-                    *path = new_path;
-                }
-            }
-            Either::Right(url) => {
-                let Some(filename) = url.path().split('/').next_back().filter(|s| !s.is_empty())
-                else {
-                    tracing::warn!(%url, "Cannot update directory on invalid URL");
-                    return;
-                };
-                let p = dir.join(filename);
-                self.path = Either::Left(p);
-            }
-        }
+        let Some(fname) = self.filename() else {
+            tracing::warn!(checked_file = %self, "Cannot update directory: no filename");
+            return;
+        };
+        self.path = Either::Left(dir.join(fname));
     }
 }
 
@@ -362,5 +362,54 @@ mod tests {
         let expected =
             Checksum::blake3("62bc124be974d3a25db05bedc99422660c26715e5bbda0b37d14bd84a0c65ab2");
         assert_eq!(expected, *cf.checksum());
+    }
+
+    #[test]
+    fn test_filename_from_local_path() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let full_path = format!("{root}/tests/data/sample-models/TinyLlama_v1.1/config.json");
+        let cf = CheckedFile::from_disk(full_path).unwrap();
+        assert_eq!(cf.filename(), Some("config.json".to_string()));
+    }
+
+    #[test]
+    fn test_filename_from_url() {
+        let url = Url::parse("hf://Qwen/Qwen3-0.6B/tokenizer.json").unwrap();
+        let cf = CheckedFile {
+            path: Either::Right(url),
+            checksum: Checksum::blake3("abc"),
+        };
+        assert_eq!(cf.filename(), Some("tokenizer.json".to_string()));
+    }
+
+    #[test]
+    fn test_filename_from_url_trailing_slash() {
+        let url = Url::parse("hf://Qwen/Qwen3-0.6B/").unwrap();
+        let cf = CheckedFile {
+            path: Either::Right(url),
+            checksum: Checksum::blake3("abc"),
+        };
+        assert_eq!(cf.filename(), None);
+    }
+
+    #[test]
+    fn test_update_dir_uses_filename() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let full_path = format!("{root}/tests/data/sample-models/TinyLlama_v1.1/config.json");
+        let mut cf = CheckedFile::from_disk(full_path).unwrap();
+        cf.update_dir(Path::new("/new/cache/dir"));
+        assert_eq!(cf.path(), Some(Path::new("/new/cache/dir/config.json")));
+    }
+
+    #[test]
+    fn test_update_dir_from_url_converts_to_local() {
+        let url = Url::parse("hf://model/tokenizer.json").unwrap();
+        let mut cf = CheckedFile {
+            path: Either::Right(url),
+            checksum: Checksum::blake3("abc"),
+        };
+        cf.update_dir(Path::new("/cache"));
+        assert_eq!(cf.path(), Some(Path::new("/cache/tokenizer.json")));
+        assert!(cf.url().is_none());
     }
 }

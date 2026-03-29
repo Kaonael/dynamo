@@ -55,6 +55,18 @@ impl ModelInfoType {
             ModelInfoType::HfConfigJson(c) => c.update_dir(dir),
         }
     }
+
+    pub fn filename(&self) -> Option<String> {
+        match self {
+            ModelInfoType::HfConfigJson(c) => c.filename(),
+        }
+    }
+
+    pub fn checked_file(&self) -> &CheckedFile {
+        match self {
+            ModelInfoType::HfConfigJson(c) => c,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -84,6 +96,18 @@ impl TokenizerKind {
             TokenizerKind::HfTokenizerJson(c) | TokenizerKind::TikTokenModel(c) => {
                 c.update_dir(dir)
             }
+        }
+    }
+
+    pub fn filename(&self) -> Option<String> {
+        match self {
+            TokenizerKind::HfTokenizerJson(c) | TokenizerKind::TikTokenModel(c) => c.filename(),
+        }
+    }
+
+    pub fn checked_file(&self) -> &CheckedFile {
+        match self {
+            TokenizerKind::HfTokenizerJson(c) | TokenizerKind::TikTokenModel(c) => c,
         }
     }
 }
@@ -136,6 +160,20 @@ impl PromptFormatterArtifact {
             PromptFormatterArtifact::HfChatTemplate { is_custom, .. } => *is_custom,
         }
     }
+
+    pub fn filename(&self) -> Option<String> {
+        match self {
+            PromptFormatterArtifact::HfTokenizerConfigJson(c) => c.filename(),
+            PromptFormatterArtifact::HfChatTemplate { file: c, .. } => c.filename(),
+        }
+    }
+
+    pub fn checked_file(&self) -> &CheckedFile {
+        match self {
+            PromptFormatterArtifact::HfTokenizerConfigJson(c) => c,
+            PromptFormatterArtifact::HfChatTemplate { file: c, .. } => c,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -170,6 +208,18 @@ impl GenerationConfig {
     pub fn update_dir(&mut self, dir: &Path) {
         match self {
             GenerationConfig::HfGenerationConfigJson(c) => c.update_dir(dir),
+        }
+    }
+
+    pub fn filename(&self) -> Option<String> {
+        match self {
+            GenerationConfig::HfGenerationConfigJson(c) => c.filename(),
+        }
+    }
+
+    pub fn checked_file(&self) -> &CheckedFile {
+        match self {
+            GenerationConfig::HfGenerationConfigJson(c) => c,
         }
     }
 }
@@ -488,7 +538,16 @@ impl ModelDeploymentCard {
     }
 
     /// Download the files this card needs to work: config.json, tokenizer.json, etc.
-    pub async fn download_config(&mut self) -> anyhow::Result<()> {
+    ///
+    /// Download priority:
+    /// 1. Local HF cache (instant, no network)
+    /// 2. ModelExpress server (internal service)
+    /// 3. P2P from any available worker (if downloader provided)
+    /// 4. Direct HuggingFace download (internet, last resort)
+    pub async fn download_config(
+        &mut self,
+        p2p_downloader: Option<&dyn crate::config_endpoint::P2pConfigDownloader>,
+    ) -> anyhow::Result<()> {
         if self.has_local_files() {
             tracing::trace!("All model config is local, not downloading");
             return Ok(());
@@ -503,10 +562,40 @@ impl ModelDeploymentCard {
             return Ok(());
         }
 
+        let model_name = self.source_path().to_string();
         let ignore_weights = true;
-        let local_path = crate::hub::from_hf(self.source_path(), ignore_weights).await?;
 
-        self.update_dir(&local_path);
+        // 1. Local HF cache
+        if let Some(cached) = crate::hub::get_cached_model_path(&model_name, ignore_weights) {
+            tracing::info!("Using cached model config for '{model_name}'");
+            self.update_dir(&cached);
+            return Ok(());
+        }
+
+        // 2. ModelExpress server (no direct HF fallback)
+        match crate::hub::try_model_express_server(&model_name, ignore_weights).await {
+            Ok(path) => {
+                tracing::info!("Downloaded model config via ModelExpress for '{model_name}'");
+                self.update_dir(&path);
+                return Ok(());
+            }
+            Err(e) => tracing::info!("ModelExpress server unavailable: {e}"),
+        }
+
+        // 3. P2P from any available worker
+        if let Some(downloader) = p2p_downloader {
+            match downloader.download(self).await {
+                Ok(()) => {
+                    tracing::info!("Downloaded model config from worker (P2P)");
+                    return Ok(());
+                }
+                Err(e) => tracing::warn!("P2P config download failed: {e}"),
+            }
+        }
+
+        // 4. Direct HuggingFace download (last resort)
+        let path = crate::hub::mx_download_direct(&model_name, ignore_weights).await?;
+        self.update_dir(&path);
         Ok(())
     }
 
@@ -573,7 +662,7 @@ impl ModelDeploymentCard {
     }
 
     /// Are all the files we need (tokenizer.json, etc) available locally?
-    fn has_local_files(&self) -> bool {
+    pub fn has_local_files(&self) -> bool {
         let has_model_info = self
             .model_info
             .as_ref()
@@ -607,8 +696,67 @@ impl ModelDeploymentCard {
             && has_gen_config
     }
 
+    /// Verify that all local config files match the checksums stored in the card.
+    /// Returns error if any file fails checksum validation.
+    pub fn verify_local_checksums(&self) -> anyhow::Result<()> {
+        let fields: Vec<(&str, Option<&CheckedFile>)> = vec![
+            ("model_info", self.model_info.as_ref().map(|v| v.checked_file())),
+            ("tokenizer", self.tokenizer.as_ref().map(|v| v.checked_file())),
+            ("prompt_formatter", self.prompt_formatter.as_ref().map(|v| v.checked_file())),
+            ("gen_config", self.gen_config.as_ref().map(|v| v.checked_file())),
+        ];
+        // chat_template handled separately for is_custom check
+        if let Some(ct) = self.chat_template_file.as_ref() {
+            if !ct.is_custom() {
+                let cf = ct.checked_file();
+                if let Some(path) = cf.path() {
+                    if path.exists() && !cf.checksum_matches(path) {
+                        anyhow::bail!("Checksum mismatch for chat_template: {}", path.display());
+                    }
+                }
+            }
+        }
+        for (name, maybe_cf) in fields {
+            if let Some(cf) = maybe_cf {
+                if let Some(path) = cf.path() {
+                    if path.exists() && !cf.checksum_matches(path) {
+                        anyhow::bail!("Checksum mismatch for {name}: {}", path.display());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Filenames of all config files tracked by this card.
+    /// Used by P2P download to know which files to request from workers.
+    pub fn config_filenames(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(f) = self.model_info.as_ref().and_then(|v| v.filename()) {
+            names.push(f);
+        }
+        if let Some(f) = self.tokenizer.as_ref().and_then(|v| v.filename()) {
+            names.push(f);
+        }
+        if let Some(f) = self.prompt_formatter.as_ref().and_then(|v| v.filename()) {
+            names.push(f);
+        }
+        // Skip custom chat templates — they weren't downloaded from HF either
+        if let Some(ct) = self.chat_template_file.as_ref() {
+            if !ct.is_custom() {
+                if let Some(f) = ct.filename() {
+                    names.push(f);
+                }
+            }
+        }
+        if let Some(f) = self.gen_config.as_ref().and_then(|v| v.filename()) {
+            names.push(f);
+        }
+        names
+    }
+
     /// Update the directory for files like tokenizer.json be in here.
-    fn update_dir(&mut self, dir: &Path) {
+    pub fn update_dir(&mut self, dir: &Path) {
         if let Some(model_info) = self.model_info.as_mut() {
             model_info.update_dir(dir);
         }
@@ -1109,5 +1257,60 @@ mod tests {
         dynamo_runtime::logging::init();
         let path = "tests/data/sample-models/NVIDIA-Nemotron-Nano-12B-v2-Base/config.json";
         let _ = HFConfig::from_json_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_config_filenames_from_disk() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/sample-models/TinyLlama_v1.1");
+        let card = super::ModelDeploymentCard::load_from_disk(&model_dir, None).unwrap();
+        let filenames = card.config_filenames();
+        assert!(filenames.contains(&"config.json".to_string()));
+        assert!(filenames.contains(&"tokenizer.json".to_string()));
+        assert!(filenames.contains(&"tokenizer_config.json".to_string()));
+        assert!(filenames.contains(&"generation_config.json".to_string()));
+    }
+
+    #[test]
+    fn test_config_filenames_empty_card() {
+        let card = super::ModelDeploymentCard::default();
+        assert!(card.config_filenames().is_empty());
+    }
+
+    #[test]
+    fn test_verify_checksums_valid() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/sample-models/TinyLlama_v1.1");
+        let card = super::ModelDeploymentCard::load_from_disk(&model_dir, None).unwrap();
+        assert!(card.verify_local_checksums().is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksums_tampered() {
+        use std::io::Write;
+
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/sample-models/TinyLlama_v1.1");
+        let card = super::ModelDeploymentCard::load_from_disk(&model_dir, None).unwrap();
+
+        // Copy to temp dir, tamper one file
+        let tmp = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(&model_dir).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), tmp.path().join(entry.file_name())).unwrap();
+        }
+        // Tamper config.json
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(tmp.path().join("config.json"))
+            .unwrap();
+        f.write_all(b"TAMPERED").unwrap();
+        drop(f);
+
+        // Use original card (with original checksums) but point it at the tampered dir
+        let mut tampered_card = card;
+        tampered_card.update_dir(tmp.path());
+        assert!(tampered_card.verify_local_checksums().is_err());
     }
 }

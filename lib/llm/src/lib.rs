@@ -12,6 +12,7 @@ use anyhow::Context as _;
 
 pub mod backend;
 pub mod common;
+pub mod config_endpoint;
 pub mod discovery;
 pub mod endpoint_type;
 pub mod engines;

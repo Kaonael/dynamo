@@ -81,6 +81,22 @@ For example:
 
 Frontends and routers discover available workers by watching the relevant prefix and receiving real-time updates when workers join or leave.
 
+### Model Config Endpoint
+
+In addition to inference endpoints (e.g., `generate`), workers automatically register a `model-config` endpoint on the same component. This endpoint serves model configuration files (`config.json`, `tokenizer.json`, `tokenizer_config.json`, etc.) to frontends over the request plane.
+
+```
+/services/{namespace}/{component}/model-config/{instance_id}
+```
+
+Frontends discover this endpoint through the standard discovery mechanism and download config files directly from any available worker. This enables:
+
+- **Private models** that are not on HuggingFace — no external downloads needed.
+- **Faster startup** — config files are served from local disk over the internal network.
+- **No shared filesystem required** — workers serve files on demand over the request plane (TCP, HTTP, or NATS).
+
+The `model-config` endpoint uses the standard `AsyncEngine` pattern and works with any transport mode. See [Frontend Configuration](../components/frontend/configuration.md#model-config-file-delivery) for the full download fallback chain.
+
 ### Lease-Based Cleanup
 
 Each runtime maintains a lease with etcd (default TTL: 10 seconds). If a worker crashes or loses connectivity:

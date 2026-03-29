@@ -18,7 +18,7 @@ use dynamo_runtime::config::environment_names::model as env_model;
 /// Uses hf-hub's Cache API to check for cached files. For tokenizer-only downloads
 /// (ignore_weights=true), we check for config.json and tokenizer files.
 /// For full downloads, we also require weight files to be present.
-fn get_cached_model_path(model_name: &str, ignore_weights: bool) -> Option<PathBuf> {
+pub(crate) fn get_cached_model_path(model_name: &str, ignore_weights: bool) -> Option<PathBuf> {
     let cache = Cache::new(get_model_express_cache_dir());
     let repo = cache.model(model_name.to_string());
 
@@ -94,12 +94,7 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
         );
     }
 
-    let mut config: MxClientConfig = MxClientConfig::default();
-    if let Ok(endpoint) = env::var(env_model::model_express::MODEL_EXPRESS_URL) {
-        config = config.with_endpoint(endpoint);
-    }
-
-    let result = match MxClient::new(config).await {
+    let result = match MxClient::new(mx_client_config()).await {
         Ok(mut client) => {
             tracing::info!("Successfully connected to ModelExpress server");
             match client
@@ -149,8 +144,29 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
     }
 }
 
-// Direct download using the ModelExpress client.
-async fn mx_download_direct(model_name: &str, ignore_weights: bool) -> anyhow::Result<PathBuf> {
+fn mx_client_config() -> MxClientConfig {
+    let mut config = MxClientConfig::default();
+    if let Ok(endpoint) = env::var(env_model::model_express::MODEL_EXPRESS_URL) {
+        config = config.with_endpoint(endpoint);
+    }
+    config
+}
+
+/// Try ModelExpress server only, without falling back to direct HuggingFace download.
+pub(crate) async fn try_model_express_server(
+    model_name: &str,
+    ignore_weights: bool,
+) -> anyhow::Result<PathBuf> {
+    let mut client = MxClient::new(mx_client_config()).await?;
+    // Use request_model_with_provider (not _and_fallback) to avoid hidden direct HF download
+    client
+        .request_model_with_provider(model_name, MxModelProvider::HuggingFace, ignore_weights)
+        .await?;
+    client.get_model_path(model_name).await
+}
+
+/// Direct download from HuggingFace using the ModelExpress client library.
+pub(crate) async fn mx_download_direct(model_name: &str, ignore_weights: bool) -> anyhow::Result<PathBuf> {
     let cache_dir = get_model_express_cache_dir();
     mx::download_model(
         model_name,
@@ -163,7 +179,7 @@ async fn mx_download_direct(model_name: &str, ignore_weights: bool) -> anyhow::R
 
 // TODO: remove in the future. This is a temporary workaround to find common
 // cache directory between client and server.
-fn get_model_express_cache_dir() -> PathBuf {
+pub(crate) fn get_model_express_cache_dir() -> PathBuf {
     // Check HF_HUB_CACHE environment variable
     // reference: https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hfhubcache
     if let Ok(cache_path) = env::var(env_model::huggingface::HF_HUB_CACHE) {

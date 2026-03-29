@@ -67,6 +67,27 @@ The Rust HTTP server also reads these environment variables (not exposed as CLI 
 | `--model-path` | `DYN_MODEL_PATH` | — | Path to local model directory (for private/custom models) |
 | `--kv-cache-block-size` | `DYN_KV_CACHE_BLOCK_SIZE` | — | KV cache block size override |
 
+## Model Config File Delivery
+
+The frontend needs model config files (`config.json`, `tokenizer.json`, `tokenizer_config.json`, etc.) to build the preprocessor. These are obtained automatically using the following fallback chain:
+
+| Priority | Source | Description |
+|----------|--------|-------------|
+| 1 | **Local HF cache** | Files already cached in `HF_HUB_CACHE` / `HF_HOME`. Instant, no network. |
+| 2 | **ModelExpress server** | Internal download service. Set `MODEL_EXPRESS_URL` to enable. |
+| 3 | **P2P from workers** | Download directly from any worker over the request plane. Automatic — workers register a `model-config` endpoint alongside inference endpoints. |
+| 4 | **Direct HuggingFace** | Internet download. Last resort. |
+
+P2P delivery is transparent and requires no configuration. It uses the same transport as inference requests (TCP, HTTP, or NATS). If no worker exposes a `model-config` endpoint within 2 seconds, the frontend falls through to HuggingFace.
+
+For **private models** not on HuggingFace, P2P (step 3) is typically the working path. Ensure at least one worker has the model files locally.
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `HF_HUB_CACHE` | `~/.cache/huggingface/hub` | Local HuggingFace cache directory |
+| `MODEL_EXPRESS_URL` | — | ModelExpress server endpoint |
+| `HF_HUB_OFFLINE` | `false` | Set to `1` to skip all HuggingFace API calls (uses cache only + P2P) |
+
 ## Infrastructure
 
 | CLI Argument | Env Var | Default | Description |

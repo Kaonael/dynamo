@@ -8,6 +8,7 @@ members = [
     "lib/runtime",
     "lib/tokens",
     "lib/data-gen",
+    "lib/kv-event-relay-proto",
     "lib/kv-hashing",
     "lib/mocker",
     "lib/kv-router",

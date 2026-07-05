@@ -1,0 +1,80 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package dynamo.kvrelay.v1;
+
+// Transport between the per-DC kv-event-relay (server) and the
+// global-router (client). One mTLS-protected gRPC connection per DC;
+// HTTP/2 multiplex carries filter updates and metrics on separate streams.
+//
+// `payload` fields carry compact, transport-private encodings defined in the
+// crate's `wire` module rather than re-declaring the domain types in protobuf.
+// Model identity travels as `fixed64 model_key` (a hash of the model id), and
+// the DC is implied by the connection, so neither string rides in any frame.
+service KvEventRelay {
+    rpc GetRelayInfo(RelayInfoRequest) returns (RelayInfo);
+
+    rpc SubscribeMetrics(SubscribeRequest) returns (stream MetricsSnapshot);
+
+    // Ships the binary CKF1 filter directly for routers on the `SnapshotCuckoo`
+    // backend, so they need no per-event RouterEvent stream.
+    rpc SubscribeFilter(SubscribeRequest) returns (stream FilterUpdate);
+}
+
+message SubscribeRequest {
+    // Lets the relay correlate logs and operator diagnostics with one
+    // subscriber session.
+    string subscriber_id = 1;
+}
+
+message RelayInfoRequest {}
+
+message RelayInfo {
+    // Instance identity fences each stream against relay restarts.
+    bytes instance_id = 1;
+    // KV block size (tokens) observed from this DC's worker MDCs. The global
+    // router refuses to ingest when this disagrees with its topology — block
+    // hashes computed under different sizes never match, so kv-overlap
+    // routing would silently degrade to noise. 0 = no worker seen yet
+    // (check skipped).
+    uint32 block_size = 2;
+}
+
+message MetricsSnapshot {
+    // Per-relay monotonic counter for metrics gap detection.
+    uint64 seq = 1;
+    // Lets the subscriber observe telemetry staleness.
+    uint64 send_ts_us = 2;
+
+    // Deterministic model-id hash; fixed64 avoids varint overhead for high-entropy keys.
+    fixed64 model_key = 6;
+
+    // Packed metric frame keeps the envelope forward-compatible.
+    bytes payload = 5;
+    // Only the first frame needs the restart fence.
+    bytes instance_id = 7;
+
+    reserved 3, 4;
+    reserved "dc_id", "model_id";
+}
+
+message FilterUpdate {
+    // Per-relay monotonic counter for gap detection.
+    uint64 seq = 1;
+    // Lets the subscriber measure freshness and delivery lag.
+    uint64 send_ts_us = 2;
+    // Deterministic model-id hash; fixed64 avoids varint overhead for high-entropy keys.
+    fixed64 model_key = 5;
+    // Binary CKF1 snapshot or delta; the header's flags byte tells full vs
+    // delta and carries dc_worker_id, epoch, seed, num_buckets. See `cuckoo`.
+    bytes payload = 4;
+    // Only the first frame needs the restart fence.
+    bytes instance_id = 6;
+    // Freshness-only updates avoid changing epoch when the filter is unchanged.
+    bool heartbeat = 7;
+
+    reserved 3;
+    reserved "model_id";
+}

@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-kv-event-relay-proto"
+description = "Shared protobuf + tonic stubs for the kv-event-relay → global-router transport."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace-level tonic/prost are pinned to 0.13 for ext-proc (Envoy gRPC), so
+# the relay → global transport pins its own 0.14 stack here, matching the
+# versions opentelemetry-otlp 0.31 already brings into the lockfile.
+prost = { version = "=0.14.3" }
+tonic = { version = "=0.14.5", default-features = false, features = ["server", "channel", "transport", "codegen", "router", "tls-ring", "zstd"] }
+tonic-prost = { version = "=0.14.5" }
+
+xxhash-rust = { workspace = true }
+# Zero-copy u16<->u8 casts for the CKF snapshot body (flat LE fingerprint
+# array); avoids per-element serialization loops on multi-MB frames.
+bytemuck = "1.22"
+thiserror = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { version = "=0.14.5" }
+
+[[bench]]
+name = "transport_costs"
+harness = false

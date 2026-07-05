@@ -25,6 +25,14 @@ xxhash-rust = { workspace = true }
 bytemuck = "1.22"
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# Examples only: the radix_vs_cuckoo comparison ingests kv-router's RouterEvent
+# stream into both its RadixTree and this crate's cuckoo filter. The library
+# itself stays free of workspace path dependencies.
+dynamo-kv-router = { path = "../kv-router" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [build-dependencies]
 tonic-prost-build = { version = "=0.14.5" }
 

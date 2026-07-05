@@ -128,3 +128,21 @@ positive can't inflate the reported depth. When comparing many DCs at once,
 — a DC that misses there can't win and is skipped without a full search.
 
 Filter internals and the CKF1 frame layout: [docs/CUCKOO.md](docs/CUCKOO.md).
+
+### Try it: compare against the kv-router radix tree
+
+`examples/radix_vs_cuckoo.rs` feeds identical Stored events into both the
+upstream kv-router `RadixTree` and this crate's per-DC cuckoo filters (built
+through the real CKF1 snapshot + delta wire path), then re-queries every
+request against both, with an exact `HashSet` oracle as ground truth:
+
+```text
+cargo run -p dynamo-kv-event-relay-proto --release --example radix_vs_cuckoo -- \
+    lib/bench/testdata/mooncake_trace_1000.jsonl 4
+```
+
+Reports per-lookup p50/p99 latency, routing-choice agreement with the oracle,
+cuckoo depth inflation/under-reporting, and index size. `mem-radix` /
+`mem-cuckoo` modes measure RSS growth of each backend in isolation. Any JSONL
+trace with per-request `hash_ids` (mooncake format) works, so the comparison
+scales to millions of blocks with generated traces.

@@ -117,7 +117,10 @@ pub fn to_frame(snapshot: &DcModelMetricsSnapshot) -> MetricFrame {
         frame.set(metric_key::WORKER_COUNT, count as f64);
     }
     if let Some(healthy) = snapshot.frontend_healthy {
-        frame.set(metric_key::FRONTEND_HEALTHY, if healthy { 1.0 } else { 0.0 });
+        frame.set(
+            metric_key::FRONTEND_HEALTHY,
+            if healthy { 1.0 } else { 0.0 },
+        );
     }
     frame
 }

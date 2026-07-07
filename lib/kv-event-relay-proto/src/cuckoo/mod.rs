@@ -9,10 +9,14 @@ mod overlap;
 mod pages;
 mod producer;
 mod snapshot;
+mod transposed;
 
 pub use filter::{CuckooFilter, DEFAULT_FILTER_SEED};
 pub use overlap::{
     Probe, argmax_overlap_dc, overlap_depth_searched, overlap_depth_searched_seq, probes_for,
+};
+pub use transposed::{
+    COHORT_LANES, CohortShapeError, MultiOverlapScratch, TransposedCohort, overlap_depths_multi,
 };
 pub use producer::{MAX_DELTA_BYTES, Publish, SnapshotProducer};
 pub use snapshot::{

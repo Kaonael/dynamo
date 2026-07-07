@@ -9,9 +9,9 @@ use super::filter::{CuckooFilter, I1_SEED_TWEAK, derive_fp, mix};
 /// Precompute per-block probes once so large DC fan-outs pay the hash cost only
 /// once per request.
 pub struct Probe {
-    fp: u16,
-    m_index: u64,
-    alt_base: u64,
+    pub(super) fp: u16,
+    pub(super) m_index: u64,
+    pub(super) alt_base: u64,
 }
 
 impl Probe {

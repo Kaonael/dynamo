@@ -48,6 +48,11 @@ pub struct PrepareOptions {
     pub ballast_seed: u64,
     pub git_sha: String,
     pub accuracy_request_limit: usize,
+    /// Publish a DC's CKF frame once per this many applied events instead of
+    /// per event, emulating a Relay that batches deltas on a publish interval
+    /// (the DEP's design point) rather than per event. 1 keeps the original
+    /// per-event cadence. CRTC still receives every raw event either way.
+    pub publish_every_n_events: usize,
 }
 
 #[derive(Clone)]
@@ -240,6 +245,8 @@ pub async fn prepare_corpus(options: &PrepareOptions) -> anyhow::Result<CorpusMa
     let mut prefix_closure_violations = 0u64;
     let mut trace_accuracy_requests = Vec::new();
     let mut logical_event_id = 0u64;
+    let publish_every = options.publish_every_n_events.max(1);
+    let mut pending_since_publish = vec![0usize; options.num_dcs];
 
     for source_entry in source {
         let operation = match source_entry.operation {
@@ -260,6 +267,26 @@ pub async fn prepare_corpus(options: &PrepareOptions) -> anyhow::Result<CorpusMa
                     &mut publisher.missing_removals,
                     &mut publisher.filter_removal_failures,
                 );
+                pending_since_publish[dc] += 1;
+                if pending_since_publish[dc] < publish_every {
+                    // Batched-relay cadence: the authoritative state advanced,
+                    // but no frame ships yet. Counted as unchanged so frame
+                    // totals still reconcile.
+                    publisher.unchanged += 1;
+                    logical_event_id += 1;
+                    entries.push(CorpusEntry {
+                        timestamp_us: source_entry.timestamp_us,
+                        stable_order: source_entry.stable_order,
+                        operation: CorpusOperation::Update {
+                            logical_event_id,
+                            dc: dc as u16,
+                            event,
+                            publication: CkfPublication::Unchanged,
+                        },
+                    });
+                    continue;
+                }
+                pending_since_publish[dc] = 0;
                 let started = Instant::now();
                 let publication = producers[dc].publish();
                 let publication = match publication {
@@ -322,6 +349,83 @@ pub async fn prepare_corpus(options: &PrepareOptions) -> anyhow::Result<CorpusMa
             stable_order: source_entry.stable_order,
             operation,
         });
+    }
+
+    // Batched cadence leaves each DC's tail of applied-but-unpublished events;
+    // flush them through synthetic no-op update entries so the router's final
+    // CKF state matches the authoritative resident state the accuracy oracle
+    // uses.
+    if publish_every > 1 {
+        let last_timestamp = entries.last().map_or(0, |entry| entry.timestamp_us);
+        let mut stable_order = entries.last().map_or(0, |entry| entry.stable_order);
+        for dc in 0..options.num_dcs {
+            if pending_since_publish[dc] == 0 {
+                continue;
+            }
+            pending_since_publish[dc] = 0;
+            let started = Instant::now();
+            let publication = match producers[dc].publish() {
+                Publish::Full(snapshot) => {
+                    let chunks: Vec<Arc<[u8]>> = snapshot.chunks().map(Arc::from).collect();
+                    let generation_ns = started.elapsed().as_nanos() as u64;
+                    publisher_timing.generation_ns += generation_ns;
+                    publisher_timing.full_generation_ns += generation_ns;
+                    let bytes = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
+                    let (filter, meta) = assemble_chunks(&chunks)?;
+                    ensure!(meta.dc_worker_id == dc as u64, "flush full DC mismatch");
+                    shadows[dc] = ConsumerShadow {
+                        filter,
+                        epoch: meta.filter_epoch,
+                    };
+                    publisher.full += 1;
+                    publisher.bytes += bytes as u64;
+                    publisher.full_bytes += bytes as u64;
+                    CkfPublication::Full(chunks)
+                }
+                Publish::Delta(frame) => {
+                    let generation_ns = started.elapsed().as_nanos() as u64;
+                    publisher_timing.generation_ns += generation_ns;
+                    publisher_timing.delta_generation_ns += generation_ns;
+                    let current_epoch = shadows[dc].epoch;
+                    let delta = apply_delta(&mut shadows[dc].filter, current_epoch, &frame)?;
+                    ensure!(delta.dc_worker_id == dc as u64, "flush delta DC mismatch");
+                    shadows[dc].epoch = delta.new_epoch;
+                    publisher.delta += 1;
+                    publisher.dirty_buckets += delta.entries.len() as u64;
+                    publisher.bytes += frame.len() as u64;
+                    publisher.delta_bytes += frame.len() as u64;
+                    CkfPublication::Delta(Arc::from(frame))
+                }
+                Publish::Unchanged => {
+                    publisher.unchanged += 1;
+                    CkfPublication::Unchanged
+                }
+            };
+            logical_event_id += 1;
+            stable_order += 1;
+            let flush_event = RouterEvent::new(
+                dc as u64,
+                KvCacheEvent {
+                    event_id: u64::MAX - dc as u64,
+                    dp_rank: 0,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: None,
+                        start_position: None,
+                        blocks: Vec::new(),
+                    }),
+                },
+            );
+            entries.push(CorpusEntry {
+                timestamp_us: last_timestamp,
+                stable_order,
+                operation: CorpusOperation::Update {
+                    logical_event_id,
+                    dc: dc as u16,
+                    event: flush_event,
+                    publication,
+                },
+            });
+        }
     }
 
     let mut accuracy_samples: Vec<AccuracySample> = trace_accuracy_requests

@@ -84,6 +84,10 @@ enum Command {
         git_sha: String,
         #[arg(long, default_value_t = 4096)]
         accuracy_requests: usize,
+        /// Publish a DC's CKF frame once per this many applied events
+        /// (batched-relay cadence); 1 = per-event, the original behavior.
+        #[arg(long, default_value_t = 1)]
+        publish_every_n_events: usize,
     },
     RunCell {
         #[arg(long)]
@@ -183,6 +187,7 @@ async fn async_main() -> anyhow::Result<()> {
             ballast_seed,
             git_sha,
             accuracy_requests,
+            publish_every_n_events,
         } => {
             let manifest = prepare_corpus(&PrepareOptions {
                 trace_path: trace,
@@ -202,6 +207,7 @@ async fn async_main() -> anyhow::Result<()> {
                 ballast_seed,
                 git_sha,
                 accuracy_request_limit: accuracy_requests,
+                publish_every_n_events,
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&manifest)?);

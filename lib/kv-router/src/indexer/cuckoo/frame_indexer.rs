@@ -132,6 +132,19 @@ struct RouterFilterState {
 /// demoted table (straggler readers still holding it are protected by the same
 /// generations). Readers never conflict with steady-state writers, at the cost
 /// of a second table.
+/// Lanes per transposed cohort: one `TransposedTable` serves up to this many
+/// DCs; larger deployments shard into a vector of cohorts, each with its own
+/// generations and (under COW) its own double buffer. All bookkeeping
+/// (availability, conflicts) is per cohort, so the DC count is unbounded and
+/// per-query cost simply grows linearly with the number of cohorts.
+/// `dc -> (dc / COHORT_DCS, dc % COHORT_DCS)`.
+const COHORT_DCS: usize = 16;
+
+#[inline]
+fn cohort_of(dc: usize) -> (usize, usize) {
+    (dc / COHORT_DCS, dc % COHORT_DCS)
+}
+
 enum TransposedCell {
     InPlace(Arc<TransposedTable>),
     Cow {
@@ -286,7 +299,7 @@ pub struct CuckooFrameIndexer {
     dcs: Vec<CuckooConsumerSession>,
     dc_indices: FxHashMap<u64, usize>,
     states: Vec<Arc<RwLock<RouterFilterState>>>,
-    transposed: Option<Arc<TransposedCell>>,
+    transposed: Option<Arc<Vec<TransposedCell>>>,
     cow: bool,
     senders: Vec<flume::Sender<ConsumerTask>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
@@ -301,10 +314,6 @@ impl CuckooFrameIndexer {
             "event_threads must be greater than zero"
         );
         ensure!(!config.dcs.is_empty(), "at least one DC is required");
-        ensure!(
-            config.dcs.len() <= 16,
-            "transposed CKF supports at most 16 DCs"
-        );
         let first = &config.dcs[0];
         let seed = first.seed;
         ensure!(
@@ -332,15 +341,20 @@ impl CuckooFrameIndexer {
         // double-buffers. Costs one extra table plus per-apply page copies.
         let cow = std::env::var("CKF_COW").is_ok_and(|value| value == "1");
         let transposed = if config.mode == CuckooIndexerMode::Transposed {
-            let cell = if cow {
-                TransposedCell::Cow {
-                    active: RwLock::new(Arc::new(TransposedTable::from_filters(&filters)?)),
-                    standby: Mutex::new(Arc::new(TransposedTable::from_filters(&filters)?)),
-                }
-            } else {
-                TransposedCell::InPlace(Arc::new(TransposedTable::from_filters(&filters)?))
-            };
-            Some(Arc::new(cell))
+            let cells: Vec<TransposedCell> = filters
+                .chunks(COHORT_DCS)
+                .map(|cohort| {
+                    Ok(if cow {
+                        TransposedCell::Cow {
+                            active: RwLock::new(Arc::new(TransposedTable::from_filters(cohort)?)),
+                            standby: Mutex::new(Arc::new(TransposedTable::from_filters(cohort)?)),
+                        }
+                    } else {
+                        TransposedCell::InPlace(Arc::new(TransposedTable::from_filters(cohort)?))
+                    })
+                })
+                .collect::<anyhow::Result<_>>()?;
+            Some(Arc::new(cells))
         } else {
             None
         };
@@ -376,7 +390,7 @@ impl CuckooFrameIndexer {
                         run_worker(
                             receiver,
                             &worker_states,
-                            worker_table.as_deref(),
+                            worker_table.as_deref().map(Vec::as_slice),
                             &worker_dcs,
                             &worker_stats,
                             worker_cow,
@@ -410,7 +424,7 @@ impl CuckooFrameIndexer {
             dc,
             &envelope,
             &self.states[dc],
-            self.transposed.as_deref(),
+            self.transposed.as_deref().map(Vec::as_slice),
             &self.dcs[dc],
             self.cow,
         )?;
@@ -549,19 +563,24 @@ impl CuckooFrameIndexer {
                 )
             })
             .collect();
-        match table.as_ref() {
-            TransposedCell::InPlace(table) => table.verify_filters(&filters),
-            TransposedCell::Cow { active, standby } => {
-                active
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .verify_filters(&filters)?;
-                standby
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .verify_filters(&filters)
+        for (cohort, cell) in table.iter().enumerate() {
+            let base = cohort * COHORT_DCS;
+            let group = &filters[base..(base + COHORT_DCS).min(filters.len())];
+            match cell {
+                TransposedCell::InPlace(table) => table.verify_filters(group)?,
+                TransposedCell::Cow { active, standby } => {
+                    active
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .verify_filters(group)?;
+                    standby
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .verify_filters(group)?;
+                }
             }
         }
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -575,17 +594,19 @@ impl CuckooFrameIndexer {
             }
         }
         if let Some(table) = &self.transposed {
-            match table.as_ref() {
-                TransposedCell::InPlace(table) => table.touch_for_benchmark(),
-                TransposedCell::Cow { active, standby } => {
-                    active
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .touch_for_benchmark();
-                    standby
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .touch_for_benchmark();
+            for cell in table.iter() {
+                match cell {
+                    TransposedCell::InPlace(table) => table.touch_for_benchmark(),
+                    TransposedCell::Cow { active, standby } => {
+                        active
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .touch_for_benchmark();
+                        standby
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .touch_for_benchmark();
+                    }
                 }
             }
         }
@@ -644,35 +665,38 @@ impl CuckooFrameIndexer {
     }
 
     fn transposed_depths(&self, probes: &[Probe]) -> Vec<u32> {
-        let table = self
-            .transposed
-            .as_ref()
-            .expect("transposed table missing")
-            .reader();
-        let mut result = table.search(probes, self.available_mask());
-        self.stats
-            .generation_conflicts
-            .fetch_add(result.conflict_mask.count_ones() as u64, Ordering::Relaxed);
-        let mut conflicts = result.conflict_mask;
-        while conflicts != 0 {
-            let dc = conflicts.trailing_zeros() as usize;
-            conflicts &= conflicts - 1;
-            self.stats.native_fallbacks.fetch_add(1, Ordering::Relaxed);
-            result.depths[dc] = self.native_depth(&self.states[dc], probes);
+        let cells = self.transposed.as_ref().expect("transposed table missing");
+        let mut depths = vec![0u32; self.states.len()];
+        for (cohort, cell) in cells.iter().enumerate() {
+            let base = cohort * COHORT_DCS;
+            let table = cell.reader();
+            let lanes = table.num_dcs();
+            let result = table.search(probes, self.cohort_available_mask(base, lanes));
+            depths[base..base + lanes].copy_from_slice(&result.depths[..lanes]);
+            self.stats
+                .generation_conflicts
+                .fetch_add(result.conflict_mask.count_ones() as u64, Ordering::Relaxed);
+            let mut conflicts = result.conflict_mask;
+            while conflicts != 0 {
+                let dc = base + conflicts.trailing_zeros() as usize;
+                conflicts &= conflicts - 1;
+                self.stats.native_fallbacks.fetch_add(1, Ordering::Relaxed);
+                depths[dc] = self.native_depth(&self.states[dc], probes);
+            }
         }
-        result.depths
+        depths
     }
 
-    fn available_mask(&self) -> u16 {
-        self.states
+    fn cohort_available_mask(&self, base: usize, lanes: usize) -> u16 {
+        self.states[base..base + lanes]
             .iter()
             .enumerate()
-            .fold(0u16, |mask, (dc, state)| {
+            .fold(0u16, |mask, (lane, state)| {
                 let available = state
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .available;
-                mask | (u16::from(available) << dc)
+                mask | (u16::from(available) << lane)
             })
     }
 }
@@ -730,10 +754,11 @@ impl KvIndexerInterface for CuckooFrameIndexer {
             state.desynchronized = true;
         }
         // Bump generations so in-flight transposed searches recheck this DC.
-        if let Some(cell) = &self.transposed {
-            cell.write(|table| {
-                let generation = table.begin_update(dc);
-                table.end_update(dc, generation);
+        if let Some(cells) = &self.transposed {
+            let (cohort, lane) = cohort_of(dc);
+            cells[cohort].write(|table| {
+                let generation = table.begin_update(lane);
+                table.end_update(lane, generation);
             });
         }
     }
@@ -786,7 +811,7 @@ impl KvIndexerInterface for CuckooFrameIndexer {
 fn run_worker(
     receiver: flume::Receiver<ConsumerTask>,
     states: &[Arc<RwLock<RouterFilterState>>],
-    transposed: Option<&TransposedCell>,
+    transposed: Option<&[TransposedCell]>,
     dcs: &[CuckooConsumerSession],
     stats: &CuckooStats,
     cow: bool,
@@ -862,7 +887,7 @@ fn apply_publication(
     dc: usize,
     envelope: &CuckooFrameEnvelope,
     state: &RwLock<RouterFilterState>,
-    transposed: Option<&TransposedCell>,
+    transposed: Option<&[TransposedCell]>,
     config: &CuckooConsumerSession,
     cow: bool,
 ) -> anyhow::Result<usize> {
@@ -907,8 +932,8 @@ fn apply_publication(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 ensure!(guard.available, "no base snapshot for DC");
                 ensure!(!guard.desynchronized, "DC is desynchronized");
-                delta = decode_delta(&guard.filter, guard.epoch, frame)
-                    .context("decode CKF delta")?;
+                delta =
+                    decode_delta(&guard.filter, guard.epoch, frame).context("decode CKF delta")?;
                 ensure!(
                     delta.dc_worker_id == config.dc_worker_id,
                     "delta DC mismatch"
@@ -916,11 +941,12 @@ fn apply_publication(
                 apply_decoded_delta(Arc::make_mut(&mut guard.filter), &delta);
                 guard.epoch = delta.new_epoch;
             }
-            if let Some(cell) = transposed {
-                cell.write(|table| {
-                    let generation = table.begin_update(dc);
-                    table.apply_entries(dc, &delta.entries);
-                    table.end_update(dc, generation);
+            if let Some(cells) = transposed {
+                let (cohort, lane) = cohort_of(dc);
+                cells[cohort].write(|table| {
+                    let generation = table.begin_update(lane);
+                    table.apply_entries(lane, &delta.entries);
+                    table.end_update(lane, generation);
                 });
             }
             Ok(delta.entries.len())
@@ -949,11 +975,12 @@ fn apply_publication(
                 guard.available = true;
                 guard.desynchronized = false;
             }
-            if let Some(cell) = transposed {
-                cell.write(|table| {
-                    let generation = table.begin_update(dc);
-                    table.rebuild_dc(dc, &filter);
-                    table.end_update(dc, generation);
+            if let Some(cells) = transposed {
+                let (cohort, lane) = cohort_of(dc);
+                cells[cohort].write(|table| {
+                    let generation = table.begin_update(lane);
+                    table.rebuild_dc(lane, &filter);
+                    table.end_update(lane, generation);
                 });
             }
             Ok(0)
@@ -1021,7 +1048,7 @@ fn classify_error(error: &anyhow::Error, stats: &CuckooStats) {
 fn mark_desynchronized(
     dc: usize,
     state: &RwLock<RouterFilterState>,
-    transposed: Option<&TransposedCell>,
+    transposed: Option<&[TransposedCell]>,
     stats: &CuckooStats,
 ) {
     {
@@ -1035,10 +1062,11 @@ fn mark_desynchronized(
         state.available = false;
     }
     // Bump generations so in-flight transposed searches recheck this DC.
-    if let Some(cell) = transposed {
-        cell.write(|table| {
-            let generation = table.begin_update(dc);
-            table.end_update(dc, generation);
+    if let Some(cells) = transposed {
+        let (cohort, lane) = cohort_of(dc);
+        cells[cohort].write(|table| {
+            let generation = table.begin_update(lane);
+            table.end_update(lane, generation);
         });
     }
 }
@@ -1203,6 +1231,91 @@ mod tests {
         );
     }
 
+    /// DC counts beyond one table shard into cohorts (16 + remainder); depths
+    /// and per-DC updates must route to the right cohort/lane on both sides
+    /// of every boundary, with no upper cap (70 exceeds a u64 mask's worth).
+    #[test]
+    fn transposed_cohorts_cover_more_than_sixteen_dcs() {
+        for dcs in [18usize, 70] {
+            transposed_cohort_case(dcs);
+        }
+    }
+
+    fn transposed_cohort_case(dcs: usize) {
+        let mut producers: Vec<SnapshotProducer> = (0..dcs)
+            .map(|dc| SnapshotProducer::new(dc as u64, 64, DEFAULT_FILTER_SEED))
+            .collect();
+        // DC d holds the chain prefix 100.. of depth d+1 (deepest = DC 17).
+        for (dc, producer) in producers.iter_mut().enumerate() {
+            for hash in 0..=dc as u64 {
+                assert!(producer.insert(100 + hash));
+            }
+        }
+        let buckets = producers[0].num_buckets();
+        let indexer = CuckooFrameIndexer::new(CuckooIndexerConfig {
+            mode: CuckooIndexerMode::Transposed,
+            event_threads: 1,
+            block_size: 16,
+            dcs: (0..dcs)
+                .map(|dc| CuckooConsumerSession {
+                    dc_worker_id: dc as u64,
+                    relay_instance_id: 10,
+                    num_buckets: buckets,
+                    seed: DEFAULT_FILTER_SEED,
+                })
+                .collect(),
+        })
+        .unwrap();
+        for (dc, producer) in producers.iter_mut().enumerate() {
+            indexer
+                .install_bootstrap(CuckooFrameEnvelope {
+                    dc_worker_id: dc as u64,
+                    relay_instance_id: 10,
+                    publication: CuckooPublication::Full(
+                        producer
+                            .full_snapshot()
+                            .chunks_with(4)
+                            .map(Arc::from)
+                            .collect(),
+                    ),
+                })
+                .unwrap();
+        }
+        indexer.verify_transposed().unwrap();
+        // Depths must be exact per DC across the cohort boundary.
+        let sequence: Vec<u64> = (0..dcs as u64).map(|offset| 100 + offset).collect();
+        let probes = probes_for(&sequence, DEFAULT_FILTER_SEED);
+        let depths = indexer.optimized_depths_for_probes(&probes);
+        for (dc, &depth) in depths.iter().enumerate() {
+            assert_eq!(depth, dc as u32 + 1, "DC {dc}");
+        }
+        // A last-cohort update routes to lane dc % 16 of the last cohort.
+        let last = dcs - 1;
+        assert!(producers[last].insert(0xDEAD_BEEF));
+        let Publish::Delta(frame) = producers[last].publish() else {
+            panic!("expected delta publication");
+        };
+        let publication = CuckooPublication::Delta(Arc::from(frame));
+        indexer
+            .submit(
+                CuckooFrameEnvelope {
+                    dc_worker_id: last as u64,
+                    relay_instance_id: 10,
+                    publication,
+                },
+                CuckooFrameMetadata {
+                    logical_event_id: 1,
+                    scheduled_at: Instant::now(),
+                },
+            )
+            .unwrap();
+        indexer.flush_with_metrics().unwrap();
+        indexer.verify_transposed().unwrap();
+        let stats = indexer.stats_snapshot();
+        assert_eq!(stats.errors.application, 0);
+        assert_eq!(stats.errors.epoch, 0);
+    }
+
     #[test]
     fn transposed_conflict_falls_back_only_for_changed_dc() {
         let mut producer0 = SnapshotProducer::new(0, 64, DEFAULT_FILTER_SEED);
@@ -1246,7 +1359,7 @@ mod tests {
                 .unwrap();
         }
         indexer.reset_stats();
-        let table = indexer.transposed.as_ref().unwrap().reader();
+        let table = indexer.transposed.as_ref().unwrap()[0].reader();
         let generation = table.begin_update(1);
         let scores = indexer.lookup(&[LocalBlockHash(11)]);
         table.end_update(1, generation);

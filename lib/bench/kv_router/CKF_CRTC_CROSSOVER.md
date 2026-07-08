@@ -7,6 +7,35 @@ This experimental branch compares the production `ConcurrentRadixTreeCompressed`
 
 The CKF filter, snapshot producer, and CKF1 wire behavior preserve the reference implementation from [Kaonael/dynamo PR #4](https://github.com/Kaonael/dynamo/pull/4), provided for [DEP #11225](https://github.com/ai-dynamo/dynamo/issues/11225). This branch is designed for evaluation and is not expected to merge as-is.
 
+## Extensions on this branch
+
+Four commits on top of the measured state extend the experiment; the
+authoritative results below predate them and measure the original code only.
+
+- **Memory-parallel transposed search**: the `TransposedTable` stable-lane
+  walk keeps its probe plan (first probe, exponential bracket, binary refine,
+  verification window), seqlock generations, and conflict semantics, but
+  compares lanes with SWAR, prefetches each phase's rows before reading any,
+  refines breadth-first, and uses fixed-capacity scratch instead of per-round
+  allocations.
+- **`CKF_COW=1`** (env, off by default): copy-on-write frame application.
+  Native filters swap whole-`Arc` page-COW clones; the transposed table
+  double-buffers (apply to standby, promote, re-apply to the demoted table,
+  stragglers caught by the existing generations). Readers never block on or
+  conflict with bulk applies, at the cost of a second table and off-read-path
+  page copies. The default in-place path remains the right shape for
+  per-event frame cadence.
+- **`--publish-every-n-events N`** (prepare, default 1): ships one CKF frame
+  per N applied events per DC instead of one per event, emulating a Relay
+  that batches deltas on a publish interval. Intermediate events advance the
+  authoritative producer state and count as unchanged publications; tails
+  flush through synthetic no-op update entries. CRTC still receives every raw
+  event.
+- **Cohort sharding**: the transposed path shards into cohorts of up to 16
+  DCs (one `TransposedTable`, generations, and COW pair per cohort), removing
+  the 16-DC cap; bookkeeping is per cohort, so the DC count is unbounded and
+  per-query cost grows linearly with the cohort count.
+
 ## Architecture and timing boundary
 
 Reusable behavior lives in `lib/kv-router/src/indexer/cuckoo/`: filtering and probes, full/delta codec, Relay envelope/session validation, epochs, desynchronization, recovery, native/transposed lookup, and the eight-thread frame consumer. Experimental native and transposed variants are also available through the standalone indexer enum/factory.

@@ -117,10 +117,64 @@ pub struct CuckooStatsSnapshot {
 }
 
 struct RouterFilterState {
-    filter: CuckooFilter,
+    filter: Arc<CuckooFilter>,
     epoch: u64,
     available: bool,
     desynchronized: bool,
+}
+
+/// How the transposed read table absorbs updates.
+///
+/// `InPlace` mutates the single shared table under per-DC seqlock generations:
+/// readers that overlap a writer conflict and fall back to the native filters.
+/// `Cow` keeps two tables and never mutates the one readers see: a writer
+/// applies to the standby, atomically swaps it in, then re-applies to the
+/// demoted table (straggler readers still holding it are protected by the same
+/// generations). Readers never conflict with steady-state writers, at the cost
+/// of a second table.
+enum TransposedCell {
+    InPlace(Arc<TransposedTable>),
+    Cow {
+        active: RwLock<Arc<TransposedTable>>,
+        /// Writer-only: the standby table plus cycle serialization.
+        standby: Mutex<Arc<TransposedTable>>,
+    },
+}
+
+impl TransposedCell {
+    fn reader(&self) -> Arc<TransposedTable> {
+        match self {
+            TransposedCell::InPlace(table) => Arc::clone(table),
+            TransposedCell::Cow { active, .. } => Arc::clone(
+                &active
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        }
+    }
+
+    /// Run `mutate` against the table(s) so that no reader-visible table is
+    /// mutated while it is active (Cow), or in place under generations
+    /// (InPlace).
+    fn write(&self, mutate: impl Fn(&TransposedTable)) {
+        match self {
+            TransposedCell::InPlace(table) => mutate(table),
+            TransposedCell::Cow { active, standby } => {
+                let mut standby_guard = standby
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                mutate(&standby_guard);
+                let demoted = {
+                    let mut active = active
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::mem::replace(&mut *active, Arc::clone(&standby_guard))
+                };
+                *standby_guard = Arc::clone(&demoted);
+                mutate(&demoted);
+            }
+        }
+    }
 }
 
 struct FrameTask {
@@ -232,7 +286,8 @@ pub struct CuckooFrameIndexer {
     dcs: Vec<CuckooConsumerSession>,
     dc_indices: FxHashMap<u64, usize>,
     states: Vec<Arc<RwLock<RouterFilterState>>>,
-    transposed: Option<Arc<TransposedTable>>,
+    transposed: Option<Arc<TransposedCell>>,
+    cow: bool,
     senders: Vec<flume::Sender<ConsumerTask>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
     dc_to_thread: Vec<usize>,
@@ -272,8 +327,20 @@ impl CuckooFrameIndexer {
             .iter()
             .map(|dc| CuckooFilter::with_num_buckets(dc.num_buckets, dc.seed))
             .collect();
+        // COW apply: readers never block on (or conflict with) bulk frame
+        // application; native filters swap whole-Arc, the transposed table
+        // double-buffers. Costs one extra table plus per-apply page copies.
+        let cow = std::env::var("CKF_COW").is_ok_and(|value| value == "1");
         let transposed = if config.mode == CuckooIndexerMode::Transposed {
-            Some(Arc::new(TransposedTable::from_filters(&filters)?))
+            let cell = if cow {
+                TransposedCell::Cow {
+                    active: RwLock::new(Arc::new(TransposedTable::from_filters(&filters)?)),
+                    standby: Mutex::new(Arc::new(TransposedTable::from_filters(&filters)?)),
+                }
+            } else {
+                TransposedCell::InPlace(Arc::new(TransposedTable::from_filters(&filters)?))
+            };
+            Some(Arc::new(cell))
         } else {
             None
         };
@@ -281,7 +348,7 @@ impl CuckooFrameIndexer {
             .into_iter()
             .map(|filter| {
                 Arc::new(RwLock::new(RouterFilterState {
-                    filter,
+                    filter: Arc::new(filter),
                     epoch: 0,
                     available: false,
                     desynchronized: false,
@@ -299,6 +366,7 @@ impl CuckooFrameIndexer {
             senders.push(sender);
             let worker_states = states.clone();
             let worker_table = transposed.clone();
+            let worker_cow = cow;
             let worker_dcs = config.dcs.clone();
             let worker_stats = Arc::clone(&stats);
             handles.push(
@@ -311,6 +379,7 @@ impl CuckooFrameIndexer {
                             worker_table.as_deref(),
                             &worker_dcs,
                             &worker_stats,
+                            worker_cow,
                         );
                     })?,
             );
@@ -323,6 +392,7 @@ impl CuckooFrameIndexer {
             dc_indices,
             states,
             transposed,
+            cow,
             senders,
             handles: Mutex::new(handles),
             dc_to_thread,
@@ -342,6 +412,7 @@ impl CuckooFrameIndexer {
             &self.states[dc],
             self.transposed.as_deref(),
             &self.dcs[dc],
+            self.cow,
         )?;
         Ok(())
     }
@@ -470,14 +541,27 @@ impl CuckooFrameIndexer {
             .states
             .iter()
             .map(|state| {
-                state
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .filter
-                    .clone()
+                CuckooFilter::clone(
+                    &state
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .filter,
+                )
             })
             .collect();
-        table.verify_filters(&filters)
+        match table.as_ref() {
+            TransposedCell::InPlace(table) => table.verify_filters(&filters),
+            TransposedCell::Cow { active, standby } => {
+                active
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .verify_filters(&filters)?;
+                standby
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .verify_filters(&filters)
+            }
+        }
     }
 
     #[cfg(feature = "bench")]
@@ -491,7 +575,19 @@ impl CuckooFrameIndexer {
             }
         }
         if let Some(table) = &self.transposed {
-            table.touch_for_benchmark();
+            match table.as_ref() {
+                TransposedCell::InPlace(table) => table.touch_for_benchmark(),
+                TransposedCell::Cow { active, standby } => {
+                    active
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .touch_for_benchmark();
+                    standby
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .touch_for_benchmark();
+                }
+            }
         }
     }
 
@@ -525,21 +621,34 @@ impl CuckooFrameIndexer {
     fn native_depths(&self, probes: &[Probe]) -> Vec<u32> {
         self.states
             .iter()
-            .map(|state| {
-                let state = state
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.available {
-                    overlap_depth_searched(&state.filter, probes)
-                } else {
-                    0
-                }
-            })
+            .map(|state| self.native_depth(state, probes))
             .collect()
     }
 
+    /// One DC's searched depth. Under COW the guard is held only for the Arc
+    /// clone, so bulk frame application never blocks the search.
+    fn native_depth(&self, state: &RwLock<RouterFilterState>, probes: &[Probe]) -> u32 {
+        let guard = state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.available {
+            return 0;
+        }
+        if self.cow {
+            let filter = Arc::clone(&guard.filter);
+            drop(guard);
+            overlap_depth_searched(&filter, probes)
+        } else {
+            overlap_depth_searched(&guard.filter, probes)
+        }
+    }
+
     fn transposed_depths(&self, probes: &[Probe]) -> Vec<u32> {
-        let table = self.transposed.as_ref().expect("transposed table missing");
+        let table = self
+            .transposed
+            .as_ref()
+            .expect("transposed table missing")
+            .reader();
         let mut result = table.search(probes, self.available_mask());
         self.stats
             .generation_conflicts
@@ -549,12 +658,7 @@ impl CuckooFrameIndexer {
             let dc = conflicts.trailing_zeros() as usize;
             conflicts &= conflicts - 1;
             self.stats.native_fallbacks.fetch_add(1, Ordering::Relaxed);
-            let state = self.states[dc]
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.available {
-                result.depths[dc] = overlap_depth_searched(&state.filter, probes);
-            }
+            result.depths[dc] = self.native_depth(&self.states[dc], probes);
         }
         result.depths
     }
@@ -618,14 +722,19 @@ impl KvIndexerInterface for CuckooFrameIndexer {
         let Some(&dc) = self.dc_indices.get(&worker_id) else {
             return;
         };
-        let mut state = self.states[dc]
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let generation = self.transposed.as_ref().map(|table| table.begin_update(dc));
-        state.available = false;
-        state.desynchronized = true;
-        if let Some(table) = &self.transposed {
-            table.end_update(dc, generation.expect("generation missing"));
+        {
+            let mut state = self.states[dc]
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.available = false;
+            state.desynchronized = true;
+        }
+        // Bump generations so in-flight transposed searches recheck this DC.
+        if let Some(cell) = &self.transposed {
+            cell.write(|table| {
+                let generation = table.begin_update(dc);
+                table.end_update(dc, generation);
+            });
         }
     }
 
@@ -677,9 +786,10 @@ impl KvIndexerInterface for CuckooFrameIndexer {
 fn run_worker(
     receiver: flume::Receiver<ConsumerTask>,
     states: &[Arc<RwLock<RouterFilterState>>],
-    transposed: Option<&TransposedTable>,
+    transposed: Option<&TransposedCell>,
     dcs: &[CuckooConsumerSession],
     stats: &CuckooStats,
+    cow: bool,
 ) {
     while let Ok(task) = receiver.recv() {
         match task {
@@ -691,6 +801,7 @@ fn run_worker(
                     &states[task.dc],
                     transposed,
                     &dcs[task.dc],
+                    cow,
                 );
                 let applied_at = Instant::now();
                 let elapsed_ns = started.elapsed().as_nanos() as u64;
@@ -751,8 +862,9 @@ fn apply_publication(
     dc: usize,
     envelope: &CuckooFrameEnvelope,
     state: &RwLock<RouterFilterState>,
-    transposed: Option<&TransposedTable>,
+    transposed: Option<&TransposedCell>,
     config: &CuckooConsumerSession,
+    cow: bool,
 ) -> anyhow::Result<usize> {
     ensure!(
         envelope.dc_worker_id == config.dc_worker_id,
@@ -765,23 +877,51 @@ fn apply_publication(
     match &envelope.publication {
         CuckooPublication::Unchanged => Ok(0),
         CuckooPublication::Delta(frame) => {
-            let mut state = state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ensure!(state.available, "no base snapshot for DC");
-            ensure!(!state.desynchronized, "DC is desynchronized");
-            let delta =
-                decode_delta(&state.filter, state.epoch, frame).context("decode CKF delta")?;
-            ensure!(
-                delta.dc_worker_id == config.dc_worker_id,
-                "delta DC mismatch"
-            );
-            let generation = transposed.map(|table| table.begin_update(dc));
-            apply_decoded_delta(&mut state.filter, &delta);
-            state.epoch = delta.new_epoch;
-            if let Some(table) = transposed {
-                table.apply_entries(dc, &delta.entries);
-                table.end_update(dc, generation.expect("generation missing"));
+            let delta;
+            if cow {
+                // Decode and apply against a snapshot so readers never wait
+                // on the bulk of the work; only the Arc swap takes the lock.
+                let (base, epoch) = {
+                    let guard = state
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    ensure!(guard.available, "no base snapshot for DC");
+                    ensure!(!guard.desynchronized, "DC is desynchronized");
+                    (Arc::clone(&guard.filter), guard.epoch)
+                };
+                delta = decode_delta(&base, epoch, frame).context("decode CKF delta")?;
+                ensure!(
+                    delta.dc_worker_id == config.dc_worker_id,
+                    "delta DC mismatch"
+                );
+                let mut next = (*base).clone();
+                apply_decoded_delta(&mut next, &delta);
+                let mut guard = state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.filter = Arc::new(next);
+                guard.epoch = delta.new_epoch;
+            } else {
+                let mut guard = state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ensure!(guard.available, "no base snapshot for DC");
+                ensure!(!guard.desynchronized, "DC is desynchronized");
+                delta = decode_delta(&guard.filter, guard.epoch, frame)
+                    .context("decode CKF delta")?;
+                ensure!(
+                    delta.dc_worker_id == config.dc_worker_id,
+                    "delta DC mismatch"
+                );
+                apply_decoded_delta(Arc::make_mut(&mut guard.filter), &delta);
+                guard.epoch = delta.new_epoch;
+            }
+            if let Some(cell) = transposed {
+                cell.write(|table| {
+                    let generation = table.begin_update(dc);
+                    table.apply_entries(dc, &delta.entries);
+                    table.end_update(dc, generation);
+                });
             }
             Ok(delta.entries.len())
         }
@@ -795,21 +935,26 @@ fn apply_publication(
                 meta.num_buckets == config.num_buckets && meta.seed == config.seed,
                 "snapshot shape or seed mismatch"
             );
-            let mut state = state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ensure!(
-                !state.available || state.desynchronized || meta.filter_epoch > state.epoch,
-                "snapshot epoch did not advance"
-            );
-            let generation = transposed.map(|table| table.begin_update(dc));
-            state.filter = filter;
-            state.epoch = meta.filter_epoch;
-            state.available = true;
-            state.desynchronized = false;
-            if let Some(table) = transposed {
-                table.rebuild_dc(dc, &state.filter);
-                table.end_update(dc, generation.expect("generation missing"));
+            let filter = Arc::new(filter);
+            {
+                let mut guard = state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ensure!(
+                    !guard.available || guard.desynchronized || meta.filter_epoch > guard.epoch,
+                    "snapshot epoch did not advance"
+                );
+                guard.filter = Arc::clone(&filter);
+                guard.epoch = meta.filter_epoch;
+                guard.available = true;
+                guard.desynchronized = false;
+            }
+            if let Some(cell) = transposed {
+                cell.write(|table| {
+                    let generation = table.begin_update(dc);
+                    table.rebuild_dc(dc, &filter);
+                    table.end_update(dc, generation);
+                });
             }
             Ok(0)
         }
@@ -876,20 +1021,25 @@ fn classify_error(error: &anyhow::Error, stats: &CuckooStats) {
 fn mark_desynchronized(
     dc: usize,
     state: &RwLock<RouterFilterState>,
-    transposed: Option<&TransposedTable>,
+    transposed: Option<&TransposedCell>,
     stats: &CuckooStats,
 ) {
-    let mut state = state
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let generation = transposed.map(|table| table.begin_update(dc));
-    if !state.desynchronized {
-        stats.desynchronizations.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut state = state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.desynchronized {
+            stats.desynchronizations.fetch_add(1, Ordering::Relaxed);
+        }
+        state.desynchronized = true;
+        state.available = false;
     }
-    state.desynchronized = true;
-    state.available = false;
-    if let Some(table) = transposed {
-        table.end_update(dc, generation.expect("generation missing"));
+    // Bump generations so in-flight transposed searches recheck this DC.
+    if let Some(cell) = transposed {
+        cell.write(|table| {
+            let generation = table.begin_update(dc);
+            table.end_update(dc, generation);
+        });
     }
 }
 
@@ -1096,7 +1246,7 @@ mod tests {
                 .unwrap();
         }
         indexer.reset_stats();
-        let table = indexer.transposed.as_ref().unwrap();
+        let table = indexer.transposed.as_ref().unwrap().reader();
         let generation = table.begin_update(1);
         let scores = indexer.lookup(&[LocalBlockHash(11)]);
         table.end_update(1, generation);

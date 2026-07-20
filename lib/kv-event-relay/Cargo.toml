@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-kv-event-relay"
+description = "Per-DC bridge from Dynamo intra-DC KV event plane to a cross-DC gRPC server-streaming endpoint."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Dynamo workspace crates — the only intra-project deps needed.
+dynamo-runtime = { path = "../runtime" }
+dynamo-kv-router = { path = "../kv-router", features = ["runtime-protocols"] }
+dynamo-kv-event-relay-proto = { path = "../kv-event-relay-proto" }
+
+# Async + gRPC + TLS wiring.
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+bytes = { workspace = true }
+clap = { version = "4.5.49", features = ["derive", "env"] }
+futures = { workspace = true }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+prometheus = { workspace = true }
+reqwest = { workspace = true }
+# FxHash for internal numeric hot-path keys (block hashes, model_key, worker_id)
+# per lib/kv-router/CLAUDE.md — SipHash is reserved for text/untrusted keys.
+rustc-hash = "2.1.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# No `tls12` feature: nothing here needs TLS 1.2 (both link ends are ours and
+# negotiate 1.3). Transitive deps (hyper-rustls via kube/reqwest) still compile
+# tls12 in, so this is hygiene, not enforcement — tonic 0.14 exposes no
+# protocol-version pin.
+rustls = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+# tonic 0.14 per-crate; the workspace default is still 0.13. See
+# lib/kv-event-relay-proto/Cargo.toml.
+tonic = { version = "0.14.6", default-features = false, features = ["server", "channel", "transport", "codegen", "router", "tls-ring", "zstd"] }
+tonic-health = { version = "0.14.6" }
+tonic-reflection = { version = "0.14.6" }
+tracing = { workspace = true }
+uuid = { workspace = true }
+# Startup-time parse of the TLS material's notAfter for the expiry gauge
+# (rotation requires a restart, so expiry must be alertable).
+x509-parser = "0.16"
+

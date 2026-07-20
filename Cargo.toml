@@ -12,6 +12,8 @@ members = [
     "lib/kv-hashing",
     "lib/mocker",
     "lib/kv-router",
+    "lib/kv-event-relay",
+    "lib/kv-event-relay-proto",
     "lib/memory",
     "lib/kvbm-common",
     "lib/kvbm-config",

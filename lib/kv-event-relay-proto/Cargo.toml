@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-kv-event-relay-proto"
+description = "Shared protobuf + tonic stubs for the kv-event-relay → global-gateway transport."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+# This lib crate needs the tonic/prost 0.14 stack (the workspace default is
+# still 0.13). Floors, not exact pins, so downstream consumers aren't forced
+# onto a single patch release; 0.14.3/0.14.6 are the versions already present
+# in the lockfile.
+prost = { version = "0.14.3" }
+tonic = { version = "0.14.6", default-features = false, features = ["server", "channel", "transport", "codegen", "router", "tls-ring", "zstd"] }
+tonic-prost = { version = "0.14.6" }
+
+xxhash-rust = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14.6" }

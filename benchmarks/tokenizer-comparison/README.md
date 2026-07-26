@@ -3,18 +3,12 @@
 
 # Tokenizer parity experiment
 
-This standalone Rust check compares the flat token-ID output of HuggingFace
-`tokenizers`, Fastokens, and Gigatoken on the same `tokenizer.json` and UTF-8
-input. It exits unsuccessfully on any mismatch.
+This standalone Rust experiment compares HuggingFace `tokenizers`, Fastokens,
+and Gigatoken without adding Gigatoken to Dynamo's production workspace or
+runtime dependency graph. It requires nightly Rust because Gigatoken currently
+does.
 
-It complements — and does not modify or replace — the existing Dynamo benches
-at `lib/llm/benches/tokenizer_simple.rs` and
-`lib/llm/benches/tokenizer_dataset.rs`. This runner checks the same two input
-shapes with Gigatoken as a third backend: `--simple` uses the legacy simple
-input, while `--input` is the corpus/dataset scenario.
-
-Gigatoken currently needs nightly Rust, so this experiment is deliberately not
-part of Dynamo's production workspace or dependency graph.
+The simple and input modes validate exact flat token-ID parity:
 
 ```bash
 cd benchmarks/tokenizer-comparison
@@ -23,16 +17,47 @@ cargo +nightly -Zprofile-rustflags run -- \
   --simple
 ```
 
-For the corpus/dataset scenario, pass the same flattened UTF-8 corpus to each
-backend:
-
 ```bash
 cargo +nightly -Zprofile-rustflags run -- \
   --tokenizer /path/to/tokenizer.json \
   --input /path/to/corpus.txt \
-  --documents 1
+  --documents 8
 ```
 
-`--documents` splits the input at UTF-8/newline boundaries; every backend
-receives the same resulting documents. The command reports only parity and the
-shared token count. It intentionally makes no performance claim.
+`--documents` splits the UTF-8 input at newline or character boundaries. Every
+backend receives the same resulting documents.
+
+## Shared dataset benchmark
+
+`--dataset` reuses the dataset loading, batch boundaries, token-ID parity
+checks, and reporting harness from
+`lib/llm/benches/tokenizer_dataset_support.rs`. The in-workspace
+`tokenizer_dataset` benchmark uses that same harness for HuggingFace and
+Fastokens; this standalone runner adds Gigatoken as a third backend.
+
+Run the LongBench-v2 scenario used by Dynamo's dataset bench:
+
+```bash
+cargo +nightly -Zprofile-rustflags run --release -- \
+  --tokenizer /path/to/tokenizer.json \
+  --dataset zai-org/LongBench-v2
+```
+
+Run its batched variant:
+
+```bash
+cargo +nightly -Zprofile-rustflags run --release -- \
+  --tokenizer /path/to/tokenizer.json \
+  --dataset zai-org/LongBench-v2 \
+  --max-samples 503 \
+  --batch-size 64
+```
+
+Supported datasets and their extraction rules match Dynamo's existing bench:
+
+- `zai-org/LongBench-v2`: the `context` field from `data.json`.
+- `RyokoAI/ShareGPT52K`: formatted conversation turns from `sg_90k_part1.json`.
+
+The shared harness warms every backend once, measures each backend separately,
+checks per-document token-ID parity, and reports total time, average latency,
+throughput, and speedup relative to HuggingFace.

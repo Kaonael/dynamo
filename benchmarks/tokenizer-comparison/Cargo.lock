@@ -571,6 +571,8 @@ version = "0.1.0"
 dependencies = [
  "fastokens",
  "gigatoken",
+ "hf-hub",
+ "serde_json",
  "tokenizers",
 ]
 

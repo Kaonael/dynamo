@@ -14,4 +14,6 @@ publish = false
 [dependencies]
 fastokens = "0.2.0"
 gigatoken_rs = { package = "gigatoken", git = "https://github.com/marcelroed/gigatoken.git", rev = "0d9765fa7312af7534535e6315a5c49d74807b2a" }
+hf-hub = { version = "0.4.3", default-features = false, features = ["rustls-tls", "ureq"] }
+serde_json = "1"
 tokenizers = { version = "0.21.4", default-features = false, features = ["onig", "esaxx_fast", "rustls-tls"] }

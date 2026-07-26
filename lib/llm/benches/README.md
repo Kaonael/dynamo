@@ -50,6 +50,10 @@ RUN_BENCH=1 DATASET=RyokoAI/ShareGPT52K MAX_SAMPLES=50 \
 RUN_BENCH=1 BATCH_SIZE=64 cargo bench --bench tokenizer_dataset -p dynamo-llm
 ```
 
+### Shared harness and Gigatoken experiment
+
+Dataset loading, document-level parity checks, batching, and reporting are shared with the standalone Gigatoken experiment through `tokenizer_dataset_support.rs`. The standalone project stays outside the Dynamo workspace so Gigatoken's PyO3 dependency does not affect the production dependency graph. See `benchmarks/tokenizer-comparison/README.md` for the three-backend LongBench-v2 commands.
+
 ### Environment variables
 
 | Variable | Default | Description |

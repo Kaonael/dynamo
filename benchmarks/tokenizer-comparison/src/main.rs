@@ -6,12 +6,18 @@
 //! This is intentionally a standalone nightly-only experiment: it keeps the
 //! Gigatoken dependency out of Dynamo's stable production dependency graph.
 
+#[path = "../../../lib/llm/benches/tokenizer_dataset_support.rs"]
+mod tokenizer_dataset_support;
+
 use std::{env, fs, path::PathBuf};
 
 use gigatoken_rs::{
     WorkerPool, encode_docs_ragged,
     load_tokenizer::hf::{HfTokenizer, load_hf_slice},
     sp_encode_docs_ragged,
+};
+use tokenizer_dataset_support::{
+    DEFAULT_MAX_SAMPLES, TokenizerBench, bench_batched, bench_sequential, load_dataset, warm_up,
 };
 
 // Keep this identical to `lib/llm/benches/tokenizer_simple.rs`.
@@ -20,8 +26,12 @@ const SIMPLE_INPUT_SENTINEL: &str = "__dynamo_tokenizer_simple_input__";
 
 struct Args {
     tokenizer: PathBuf,
-    input: PathBuf,
+    input: Option<PathBuf>,
+    simple: bool,
     documents: usize,
+    dataset: Option<String>,
+    max_samples: usize,
+    batch_size: Option<usize>,
 }
 
 fn required_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
@@ -33,7 +43,11 @@ impl Args {
     fn parse() -> Result<Self, String> {
         let mut tokenizer = None;
         let mut input = None;
+        let mut simple = false;
         let mut documents = 1;
+        let mut dataset = None;
+        let mut max_samples = DEFAULT_MAX_SAMPLES;
+        let mut batch_size = None;
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -42,11 +56,24 @@ impl Args {
                     tokenizer = Some(PathBuf::from(required_value(&mut args, "--tokenizer")?))
                 }
                 "--input" => input = Some(PathBuf::from(required_value(&mut args, "--input")?)),
-                "--simple" => input = Some(PathBuf::from(SIMPLE_INPUT_SENTINEL)),
+                "--simple" => simple = true,
                 "--documents" => {
                     documents = required_value(&mut args, "--documents")?
                         .parse()
                         .map_err(|_| "--documents must be a positive integer".to_string())?
+                }
+                "--dataset" => dataset = Some(required_value(&mut args, "--dataset")?),
+                "--max-samples" => {
+                    max_samples = required_value(&mut args, "--max-samples")?
+                        .parse()
+                        .map_err(|_| "--max-samples must be a positive integer".to_string())?
+                }
+                "--batch-size" => {
+                    batch_size = Some(
+                        required_value(&mut args, "--batch-size")?
+                            .parse()
+                            .map_err(|_| "--batch-size must be a positive integer".to_string())?,
+                    )
                 }
                 "-h" | "--help" => return Err(Self::usage()),
                 _ => return Err(format!("unknown argument {arg}\n\n{}", Self::usage())),
@@ -55,17 +82,131 @@ impl Args {
 
         let args = Self {
             tokenizer: tokenizer.ok_or_else(Self::usage)?,
-            input: input.ok_or_else(Self::usage)?,
+            input,
+            simple,
             documents,
+            dataset,
+            max_samples,
+            batch_size,
         };
-        if args.documents == 0 {
-            return Err("--documents must be positive".to_string());
+        if args.documents == 0 || args.max_samples == 0 || args.batch_size == Some(0) {
+            return Err(
+                "--documents, --max-samples, and --batch-size must be positive".to_string(),
+            );
+        }
+        if (args.input.is_some() || args.simple) == args.dataset.is_some() {
+            return Err(format!(
+                "select exactly one input mode\n\n{}",
+                Self::usage()
+            ));
         }
         Ok(args)
     }
 
     fn usage() -> String {
-        "Usage: cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH (--simple | --input PATH) [--documents N]".to_string()
+        "Usage:\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH (--simple | --input PATH) [--documents N]\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH --dataset DATASET [--max-samples N] [--batch-size N]".to_string()
+    }
+}
+
+struct HuggingFaceBench(tokenizers::Tokenizer);
+
+impl TokenizerBench for HuggingFaceBench {
+    fn name(&self) -> &'static str {
+        "HuggingFace"
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        self.0
+            .encode(text, false)
+            .map(|encoding| encoding.get_ids().to_vec())
+            .map_err(|error| error.to_string())
+    }
+
+    fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<u32>>, String> {
+        self.0
+            .encode_batch(texts.to_vec(), false)
+            .map(|encodings| {
+                encodings
+                    .into_iter()
+                    .map(|encoding| encoding.get_ids().to_vec())
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct FastokensBench(fastokens::Tokenizer);
+
+impl TokenizerBench for FastokensBench {
+    fn name(&self) -> &'static str {
+        "Fastokens"
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        self.0
+            .encode_batch(&[text], false)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Fastokens returned no encoding".to_string())
+    }
+
+    fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<u32>>, String> {
+        self.0
+            .encode_batch(texts, false)
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct GigatokenBench {
+    tokenizer: HfTokenizer,
+    workers: WorkerPool,
+}
+
+impl GigatokenBench {
+    fn unpack(ids: Vec<u32>, lengths: Vec<i64>) -> Result<Vec<Vec<u32>>, String> {
+        let mut offset = 0usize;
+        let mut documents = Vec::with_capacity(lengths.len());
+        for length in lengths {
+            let length =
+                usize::try_from(length).map_err(|_| "negative token length".to_string())?;
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| "token length overflow".to_string())?;
+            let tokens = ids
+                .get(offset..end)
+                .ok_or_else(|| "invalid Gigatoken ragged result".to_string())?;
+            documents.push(tokens.to_vec());
+            offset = end;
+        }
+        if offset != ids.len() {
+            return Err("Gigatoken ragged result did not consume all token IDs".to_string());
+        }
+        Ok(documents)
+    }
+}
+
+impl TokenizerBench for GigatokenBench {
+    fn name(&self) -> &'static str {
+        "Gigatoken"
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        self.encode_batch(&[text])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Gigatoken returned no encoding".to_string())
+    }
+
+    fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<u32>>, String> {
+        let (ids, lengths) = match &self.tokenizer {
+            HfTokenizer::Bpe(tokenizer) => {
+                let docs: Vec<&[u8]> = texts.iter().map(|text| text.as_bytes()).collect();
+                encode_docs_ragged(&self.workers, tokenizer, &docs)
+            }
+            HfTokenizer::SentencePiece(tokenizer) => sp_encode_docs_ragged(tokenizer, texts),
+        };
+        Self::unpack(ids, lengths)
     }
 }
 
@@ -101,13 +242,62 @@ fn split_documents(input: &str, count: usize) -> Vec<&str> {
     documents
 }
 
+fn input_parity(documents: &[&str], tokenizers: &[&dyn TokenizerBench]) -> Result<(), String> {
+    let results = tokenizers
+        .iter()
+        .map(|tokenizer| tokenizer.encode_batch(documents))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, result) in results.iter().enumerate().skip(1) {
+        if results[0] != *result {
+            return Err(format!(
+                "token parity failed: {} and {} returned different token IDs",
+                tokenizers[0].name(),
+                tokenizers[index].name(),
+            ));
+        }
+    }
+    let tokens = results[0].iter().map(Vec::len).sum::<usize>();
+    println!("token parity: OK ({tokens} token IDs for all backends)");
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let args = Args::parse()?;
-    let input = if args.input == PathBuf::from(SIMPLE_INPUT_SENTINEL) {
+    let hf = HuggingFaceBench(
+        tokenizers::Tokenizer::from_file(&args.tokenizer)
+            .map_err(|error| format!("failed to load HF tokenizer: {error}"))?,
+    );
+    let fast = FastokensBench(
+        fastokens::Tokenizer::from_file(&args.tokenizer)
+            .map_err(|error| format!("failed to load Fastokens tokenizer: {error}"))?,
+    );
+    let tokenizer_json = fs::read(&args.tokenizer)
+        .map_err(|error| format!("failed to read {}: {error}", args.tokenizer.display()))?;
+    let gigatoken = GigatokenBench {
+        tokenizer: load_hf_slice(&tokenizer_json)
+            .map_err(|error| format!("failed to load Gigatoken tokenizer: {error}"))?,
+        workers: WorkerPool::new(),
+    };
+    let tokenizers: [&dyn TokenizerBench; 3] = [&hf, &fast, &gigatoken];
+
+    if let Some(dataset) = args.dataset {
+        let samples = load_dataset(&dataset, args.max_samples);
+        warm_up(&samples, &tokenizers)?;
+        return match args.batch_size {
+            Some(batch_size) => bench_batched(&samples, &tokenizers, batch_size),
+            None => bench_sequential(&samples, &tokenizers),
+        };
+    }
+
+    let input = if args.simple {
         SIMPLE_PROMPT.repeat(8_000 / SIMPLE_PROMPT.len())
     } else {
-        fs::read_to_string(&args.input)
-            .map_err(|error| format!("failed to read {}: {error}", args.input.display()))?
+        fs::read_to_string(
+            args.input
+                .as_ref()
+                .expect("input mode checked during parsing"),
+        )
+        .map_err(|error| format!("failed to read input: {error}"))?
     };
     let documents = split_documents(&input, args.documents);
     let bytes = documents
@@ -115,59 +305,5 @@ fn main() -> Result<(), String> {
         .map(|document| document.len())
         .sum::<usize>();
     println!("input={bytes} bytes, documents={}", documents.len());
-
-    let hf = tokenizers::Tokenizer::from_file(&args.tokenizer)
-        .map_err(|error| format!("failed to load HF tokenizer: {error}"))?;
-    let fast = fastokens::Tokenizer::from_file(&args.tokenizer)
-        .map_err(|error| format!("failed to load Fastokens tokenizer: {error}"))?;
-    let hf_documents = documents.to_vec();
-    let fast_documents = documents.to_vec();
-    let gigatoken_documents = documents.clone();
-
-    let hf_ids = hf
-        .encode_batch(hf_documents, false)
-        .map(|encodings| {
-            encodings
-                .into_iter()
-                .flat_map(|encoding| encoding.get_ids().to_vec())
-                .collect::<Vec<_>>()
-        })
-        .map_err(|error| error.to_string())?;
-    let fast_ids = fast
-        .encode_batch(&fast_documents, false)
-        .map(|encodings| encodings.into_iter().flatten().collect::<Vec<_>>())
-        .map_err(|error| error.to_string())?;
-
-    let tokenizer_json = fs::read(&args.tokenizer)
-        .map_err(|error| format!("failed to read {}: {error}", args.tokenizer.display()))?;
-    let gigatoken = load_hf_slice(&tokenizer_json)
-        .map_err(|error| format!("failed to load Gigatoken tokenizer: {error}"))?;
-    let gigatoken_ids = match gigatoken {
-        HfTokenizer::Bpe(tokenizer) => {
-            let worker_pool = WorkerPool::new();
-            let documents: Vec<&[u8]> = gigatoken_documents
-                .iter()
-                .map(|document| document.as_bytes())
-                .collect();
-            encode_docs_ragged(&worker_pool, &tokenizer, &documents).0
-        }
-        HfTokenizer::SentencePiece(tokenizer) => {
-            sp_encode_docs_ragged(&tokenizer, &gigatoken_documents).0
-        }
-    };
-
-    if hf_ids != fast_ids || hf_ids != gigatoken_ids {
-        return Err(format!(
-            "token parity failed: hf={}, fastokens={}, gigatoken={}",
-            hf_ids.len(),
-            fast_ids.len(),
-            gigatoken_ids.len(),
-        ));
-    }
-
-    println!(
-        "token parity: OK ({} token IDs for all backends)",
-        hf_ids.len()
-    );
-    Ok(())
+    input_parity(&documents, &tokenizers)
 }

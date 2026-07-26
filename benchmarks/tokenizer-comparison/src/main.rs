@@ -33,6 +33,7 @@ struct Args {
     max_samples: usize,
     batch_size: Option<usize>,
     backend: Option<Backend>,
+    memory: bool,
 }
 #[derive(Clone, Copy)]
 enum Backend {
@@ -67,6 +68,7 @@ impl Args {
         let mut max_samples = DEFAULT_MAX_SAMPLES;
         let mut batch_size = None;
         let mut backend = None;
+        let mut memory = false;
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -97,6 +99,7 @@ impl Args {
                 "--backend" => {
                     backend = Some(Backend::parse(&required_value(&mut args, "--backend")?)?)
                 }
+                "--memory" => memory = true,
                 "-h" | "--help" => return Err(Self::usage()),
                 _ => return Err(format!("unknown argument {arg}\n\n{}", Self::usage())),
             }
@@ -111,6 +114,7 @@ impl Args {
             max_samples,
             batch_size,
             backend,
+            memory,
         };
         if args.documents == 0 || args.max_samples == 0 || args.batch_size == Some(0) {
             return Err(
@@ -126,11 +130,14 @@ impl Args {
         if args.backend.is_some() && args.dataset.is_none() {
             return Err("--backend is supported only with --dataset".to_string());
         }
+        if args.memory && args.backend.is_none() {
+            return Err("--memory requires --backend".to_string());
+        }
         Ok(args)
     }
 
     fn usage() -> String {
-        "Usage:\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH (--simple | --input PATH) [--documents N]\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH --dataset DATASET [--max-samples N] [--batch-size N] [--backend huggingface|fastokens|gigatoken]".to_string()
+        "Usage:\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH (--simple | --input PATH) [--documents N]\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH --dataset DATASET [--max-samples N] [--batch-size N] [--backend huggingface|fastokens|gigatoken] [--memory]".to_string()
     }
 }
 
@@ -287,8 +294,146 @@ fn input_parity(documents: &[&str], tokenizers: &[&dyn TokenizerBench]) -> Resul
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct MemorySnapshot {
+    rss_kib: u64,
+    hwm_kib: u64,
+}
+
+fn status_kib(field: &str) -> Result<u64, String> {
+    let status = fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("failed to read /proc/self/status: {error}"))?;
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .ok_or_else(|| format!("{field} missing from /proc/self/status"))?
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("{field} has no value"))?;
+    value
+        .parse()
+        .map_err(|error| format!("failed to parse {field}: {error}"))
+}
+
+fn memory_snapshot() -> Result<MemorySnapshot, String> {
+    Ok(MemorySnapshot {
+        rss_kib: status_kib("VmRSS:")?,
+        hwm_kib: status_kib("VmHWM:")?,
+    })
+}
+
+fn report_memory(label: &str, snapshot: MemorySnapshot, baseline: MemorySnapshot) {
+    let rss_delta_kib = snapshot.rss_kib as i64 - baseline.rss_kib as i64;
+    let hwm_growth_kib = snapshot.hwm_kib as i64 - baseline.hwm_kib as i64;
+    eprintln!(
+        "[memory] {label}: rss={:.2} GiB (delta {:+.2} GiB), hwm={:.2} GiB (growth {:+.2} GiB)",
+        snapshot.rss_kib as f64 / 1024.0 / 1024.0,
+        rss_delta_kib as f64 / 1024.0 / 1024.0,
+        snapshot.hwm_kib as f64 / 1024.0 / 1024.0,
+        hwm_growth_kib as f64 / 1024.0 / 1024.0,
+    );
+}
+
+fn run_dataset_benchmark(
+    args: &Args,
+    samples: &[String],
+    tokenizers: &[&dyn TokenizerBench],
+) -> Result<(), String> {
+    match args.batch_size {
+        Some(batch_size) => bench_batched(samples, tokenizers, batch_size),
+        None => bench_sequential(samples, tokenizers),
+    }
+}
+
+fn run_isolated_dataset<T: TokenizerBench>(
+    args: &Args,
+    samples: &[String],
+    tokenizer: T,
+    baseline: Option<MemorySnapshot>,
+) -> Result<(), String> {
+    if let Some(baseline) = baseline {
+        report_memory("tokenizer initialized", memory_snapshot()?, baseline);
+    }
+    let tokenizers: [&dyn TokenizerBench; 1] = [&tokenizer];
+    warm_up(samples, &tokenizers)?;
+    if let Some(baseline) = baseline {
+        report_memory("warmup complete", memory_snapshot()?, baseline);
+    }
+    run_dataset_benchmark(args, samples, &tokenizers)?;
+    if let Some(baseline) = baseline {
+        report_memory("benchmark complete", memory_snapshot()?, baseline);
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let args = Args::parse()?;
+
+    if let Some(dataset) = args.dataset.as_deref() {
+        let samples = load_dataset(dataset, args.max_samples);
+        let baseline = args.memory.then(memory_snapshot).transpose()?;
+        if let Some(baseline) = baseline {
+            report_memory("dataset loaded", baseline, baseline);
+        }
+        return match args.backend {
+            Some(Backend::HuggingFace) => run_isolated_dataset(
+                &args,
+                &samples,
+                HuggingFaceBench(
+                    tokenizers::Tokenizer::from_file(&args.tokenizer)
+                        .map_err(|error| format!("failed to load HF tokenizer: {error}"))?,
+                ),
+                baseline,
+            ),
+            Some(Backend::Fastokens) => run_isolated_dataset(
+                &args,
+                &samples,
+                FastokensBench(
+                    fastokens::Tokenizer::from_file(&args.tokenizer)
+                        .map_err(|error| format!("failed to load Fastokens tokenizer: {error}"))?,
+                ),
+                baseline,
+            ),
+            Some(Backend::Gigatoken) => {
+                let tokenizer_json = fs::read(&args.tokenizer).map_err(|error| {
+                    format!("failed to read {}: {error}", args.tokenizer.display())
+                })?;
+                run_isolated_dataset(
+                    &args,
+                    &samples,
+                    GigatokenBench {
+                        tokenizer: load_hf_slice(&tokenizer_json).map_err(|error| {
+                            format!("failed to load Gigatoken tokenizer: {error}")
+                        })?,
+                        workers: WorkerPool::new(),
+                    },
+                    baseline,
+                )
+            }
+            None => {
+                let hf = HuggingFaceBench(
+                    tokenizers::Tokenizer::from_file(&args.tokenizer)
+                        .map_err(|error| format!("failed to load HF tokenizer: {error}"))?,
+                );
+                let fast = FastokensBench(
+                    fastokens::Tokenizer::from_file(&args.tokenizer)
+                        .map_err(|error| format!("failed to load Fastokens tokenizer: {error}"))?,
+                );
+                let tokenizer_json = fs::read(&args.tokenizer).map_err(|error| {
+                    format!("failed to read {}: {error}", args.tokenizer.display())
+                })?;
+                let gigatoken = GigatokenBench {
+                    tokenizer: load_hf_slice(&tokenizer_json)
+                        .map_err(|error| format!("failed to load Gigatoken tokenizer: {error}"))?,
+                    workers: WorkerPool::new(),
+                };
+                let tokenizers: [&dyn TokenizerBench; 3] = [&hf, &fast, &gigatoken];
+                warm_up(&samples, &tokenizers)?;
+                run_dataset_benchmark(&args, &samples, &tokenizers)
+            }
+        };
+    }
+
     let hf = HuggingFaceBench(
         tokenizers::Tokenizer::from_file(&args.tokenizer)
             .map_err(|error| format!("failed to load HF tokenizer: {error}"))?,
@@ -305,21 +450,6 @@ fn main() -> Result<(), String> {
         workers: WorkerPool::new(),
     };
     let all_tokenizers: [&dyn TokenizerBench; 3] = [&hf, &fast, &gigatoken];
-
-    if let Some(dataset) = args.dataset {
-        let tokenizers = match args.backend {
-            Some(Backend::HuggingFace) => vec![&hf as &dyn TokenizerBench],
-            Some(Backend::Fastokens) => vec![&fast as &dyn TokenizerBench],
-            Some(Backend::Gigatoken) => vec![&gigatoken as &dyn TokenizerBench],
-            None => all_tokenizers.to_vec(),
-        };
-        let samples = load_dataset(&dataset, args.max_samples);
-        warm_up(&samples, &tokenizers)?;
-        return match args.batch_size {
-            Some(batch_size) => bench_batched(&samples, &tokenizers, batch_size),
-            None => bench_sequential(&samples, &tokenizers),
-        };
-    }
 
     let input = if args.simple {
         SIMPLE_PROMPT.repeat(8_000 / SIMPLE_PROMPT.len())

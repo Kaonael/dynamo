@@ -53,6 +53,20 @@ cargo +nightly -Zprofile-rustflags run --release -- \
   --batch-size 64
 ```
 
+
+
+To measure one backend memory without constructing the other two, pass both
+`--backend` and `--memory`:
+
+```bash
+cargo +nightly -Zprofile-rustflags run --release -- --tokenizer /path/to/tokenizer.json --dataset zai-org/LongBench-v2 --max-samples 503 --batch-size 64 --backend gigatoken --memory
+```
+
+This reports Linux process `VmRSS` and `VmHWM` after dataset loading, tokenizer
+initialization, warmup, and the benchmark. Deltas use the post-dataset snapshot
+as their baseline; they are process-level measurements, not per-allocation
+attribution.
+
 Supported datasets and their extraction rules match Dynamo's existing bench:
 
 - `zai-org/LongBench-v2`: the `context` field from `data.json`.

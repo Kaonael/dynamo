@@ -6,6 +6,7 @@
 //! This is intentionally a standalone nightly-only experiment: it keeps the
 //! Gigatoken dependency out of Dynamo's stable production dependency graph.
 
+#[allow(dead_code)]
 #[path = "../../../lib/llm/benches/tokenizer_dataset_support.rs"]
 mod tokenizer_dataset_support;
 
@@ -22,7 +23,6 @@ use tokenizer_dataset_support::{
 
 // Keep this identical to `lib/llm/benches/tokenizer_simple.rs`.
 const SIMPLE_PROMPT: &str = "The cat sat by the window, watching raindrops race down the glass. Far thunder rumbled. She purred softly, feeling safe at home.";
-const SIMPLE_INPUT_SENTINEL: &str = "__dynamo_tokenizer_simple_input__";
 
 struct Args {
     tokenizer: PathBuf,
@@ -32,6 +32,24 @@ struct Args {
     dataset: Option<String>,
     max_samples: usize,
     batch_size: Option<usize>,
+    backend: Option<Backend>,
+}
+#[derive(Clone, Copy)]
+enum Backend {
+    HuggingFace,
+    Fastokens,
+    Gigatoken,
+}
+
+impl Backend {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "huggingface" => Ok(Self::HuggingFace),
+            "fastokens" => Ok(Self::Fastokens),
+            "gigatoken" => Ok(Self::Gigatoken),
+            _ => Err("--backend must be huggingface, fastokens, or gigatoken".to_string()),
+        }
+    }
 }
 
 fn required_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
@@ -48,6 +66,7 @@ impl Args {
         let mut dataset = None;
         let mut max_samples = DEFAULT_MAX_SAMPLES;
         let mut batch_size = None;
+        let mut backend = None;
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -75,6 +94,9 @@ impl Args {
                             .map_err(|_| "--batch-size must be a positive integer".to_string())?,
                     )
                 }
+                "--backend" => {
+                    backend = Some(Backend::parse(&required_value(&mut args, "--backend")?)?)
+                }
                 "-h" | "--help" => return Err(Self::usage()),
                 _ => return Err(format!("unknown argument {arg}\n\n{}", Self::usage())),
             }
@@ -88,6 +110,7 @@ impl Args {
             dataset,
             max_samples,
             batch_size,
+            backend,
         };
         if args.documents == 0 || args.max_samples == 0 || args.batch_size == Some(0) {
             return Err(
@@ -100,11 +123,14 @@ impl Args {
                 Self::usage()
             ));
         }
+        if args.backend.is_some() && args.dataset.is_none() {
+            return Err("--backend is supported only with --dataset".to_string());
+        }
         Ok(args)
     }
 
     fn usage() -> String {
-        "Usage:\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH (--simple | --input PATH) [--documents N]\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH --dataset DATASET [--max-samples N] [--batch-size N]".to_string()
+        "Usage:\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH (--simple | --input PATH) [--documents N]\n  cargo +nightly -Zprofile-rustflags run -- --tokenizer PATH --dataset DATASET [--max-samples N] [--batch-size N] [--backend huggingface|fastokens|gigatoken]".to_string()
     }
 }
 
@@ -278,9 +304,15 @@ fn main() -> Result<(), String> {
             .map_err(|error| format!("failed to load Gigatoken tokenizer: {error}"))?,
         workers: WorkerPool::new(),
     };
-    let tokenizers: [&dyn TokenizerBench; 3] = [&hf, &fast, &gigatoken];
+    let all_tokenizers: [&dyn TokenizerBench; 3] = [&hf, &fast, &gigatoken];
 
     if let Some(dataset) = args.dataset {
+        let tokenizers = match args.backend {
+            Some(Backend::HuggingFace) => vec![&hf as &dyn TokenizerBench],
+            Some(Backend::Fastokens) => vec![&fast as &dyn TokenizerBench],
+            Some(Backend::Gigatoken) => vec![&gigatoken as &dyn TokenizerBench],
+            None => all_tokenizers.to_vec(),
+        };
         let samples = load_dataset(&dataset, args.max_samples);
         warm_up(&samples, &tokenizers)?;
         return match args.batch_size {
@@ -305,5 +337,5 @@ fn main() -> Result<(), String> {
         .map(|document| document.len())
         .sum::<usize>();
     println!("input={bytes} bytes, documents={}", documents.len());
-    input_parity(&documents, &tokenizers)
+    input_parity(&documents, &all_tokenizers)
 }

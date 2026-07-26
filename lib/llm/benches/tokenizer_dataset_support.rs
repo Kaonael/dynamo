@@ -231,7 +231,9 @@ pub fn bench_sequential(
         }
     }
 
-    if mismatches == 0 {
+    if tokenizers.len() == 1 {
+        eprintln!("[skip] parity check requires two or more tokenizers");
+    } else if mismatches == 0 {
         eprintln!("[OK] All samples produced identical token IDs");
     } else {
         eprintln!("[WARNING] {mismatches} samples had mismatched token IDs");
@@ -313,7 +315,9 @@ pub fn bench_batched(
         }
     }
 
-    if mismatches == 0 {
+    if tokenizers.len() == 1 {
+        eprintln!("[skip] parity check requires two or more tokenizers");
+    } else if mismatches == 0 {
         eprintln!("[OK] All samples produced identical token IDs");
     } else {
         eprintln!("[WARNING] {mismatches} samples had mismatched token IDs");

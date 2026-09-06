@@ -21,6 +21,8 @@ pub enum WireIdentityError {
     PoolIdentityVersion(u32),
     #[error("{0} is missing")]
     MissingField(&'static str),
+    #[error("model target variant is missing or unknown")]
+    UnsupportedModelTarget,
     #[error("{field} digest has {actual} bytes, expected 16")]
     DigestLength { field: &'static str, actual: usize },
     #[error("{field} has invalid identity source {value}")]
@@ -69,6 +71,79 @@ pub enum WireIdentityError {
     TopologyNamespaceMismatch { topology: String, member: String },
     #[error("serving topology repeats adapter {0:?}")]
     DuplicateAdapter(String),
+}
+
+impl WireIdentityError {
+    /// Unsupported semantics are not permission to use a default interpretation.
+    /// Quarantine the containing pool/topology; keep unrelated supported entries.
+    pub fn is_unsupported(&self) -> bool {
+        match self {
+            Self::PoolIdentityVersion(version) => *version != 0,
+            Self::QueryHashFormat(value) | Self::WorkerRole(value) => *value != 0,
+            Self::IdentitySource { value, .. } => *value != 0,
+            Self::UnsupportedModelTarget
+            | Self::UnsupportedCkfFormat { .. }
+            | Self::ReadinessState(_)
+            | Self::BucketCountTooLarge { .. }
+            | Self::BucketCountOverflow => true,
+            _ => false,
+        }
+    }
+}
+
+/// Validated, frozen v1 equality key. Descriptor metadata never participates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProducerKey<'a> {
+    identity_version: u32,
+    cache_semantics: (&'a [u8], i32),
+    routing_scope: (&'a [u8], i32),
+    dc_id: u64,
+    producer_incarnation: u64,
+    layout_generation: u64,
+    ckf_format: (u32, u64, u64, u32, u32),
+}
+
+impl<'a> TryFrom<&'a ProducerIdentity> for ProducerKey<'a> {
+    type Error = WireIdentityError;
+
+    fn try_from(identity: &'a ProducerIdentity) -> Result<Self, Self::Error> {
+        validate_producer_identity(identity)?;
+        let pool = identity
+            .pool_id
+            .as_ref()
+            .ok_or(WireIdentityError::MissingField("producer pool ID"))?;
+        let domain = pool
+            .indexer_domain
+            .as_ref()
+            .ok_or(WireIdentityError::MissingField("indexer domain"))?;
+        let cache = domain
+            .cache_semantics
+            .as_ref()
+            .ok_or(WireIdentityError::MissingField("cache semantics"))?;
+        let routing = domain
+            .routing_scope
+            .as_ref()
+            .ok_or(WireIdentityError::MissingField("routing scope"))?;
+        let format = identity
+            .ckf_format
+            .as_ref()
+            .ok_or(WireIdentityError::MissingField("producer CKF format"))?;
+        Ok(Self {
+            identity_version: pool.identity_version,
+            cache_semantics: (&cache.digest, cache.source),
+            routing_scope: (&routing.digest, routing.source),
+            dc_id: pool.dc_id,
+            producer_incarnation: identity.producer_incarnation,
+            layout_generation: identity.layout_generation,
+            ckf_format: (
+                format.format_version,
+                format.seed,
+                format.bucket_count,
+                format.fingerprint_bits,
+                format.slots_per_bucket,
+            ),
+        })
+    }
 }
 
 pub fn validate_contract_marker(contract_marker: u32) -> Result<(), WireIdentityError> {
@@ -172,8 +247,10 @@ pub fn validate_model_registration(
     let target = registration
         .target
         .as_ref()
-        .and_then(|target| target.target.as_ref())
-        .ok_or(WireIdentityError::MissingField("model target"))?;
+        .ok_or(WireIdentityError::MissingField("model target"))?
+        .target
+        .as_ref()
+        .ok_or(WireIdentityError::UnsupportedModelTarget)?;
     match target {
         model_target::Target::Base(base) => validate_text("base model ID", &base.base_model)?,
         model_target::Target::Lora(lora) => {

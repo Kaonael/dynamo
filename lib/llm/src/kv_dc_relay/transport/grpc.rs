@@ -25,6 +25,7 @@ use super::identity::{
 };
 use super::load::LoadUpdateHub;
 use super::source::WanPublicationSource;
+use proto::RelayErrorReason;
 
 type CatalogStream =
     Pin<Box<dyn Stream<Item = Result<proto::KvPoolCatalogUpdate, Status>> + Send + 'static>>;
@@ -90,7 +91,8 @@ impl SubscriberLimits {
                 StreamKind::Readiness => "readiness stream",
                 StreamKind::Load => "load stream",
             };
-            Status::resource_exhausted(format!("Relay {resource} limit {} reached", limit.maximum))
+            RelayErrorReason::ResourceLimit
+                .status(format!("Relay {resource} limit {} reached", limit.maximum))
         })
     }
 }
@@ -196,20 +198,22 @@ impl proto::KvEventRelay for KvEventRelayService {
         require_contract(request.contract_marker)?;
         let subscriber_id = validate_subscriber_id(request.subscriber_id)?;
         let expected_producer = request.expected_producer.ok_or_else(|| {
-            Status::invalid_argument("SubscribeKvPool requires expected_producer")
+            RelayErrorReason::InvalidRequest.status("SubscribeKvPool requires expected_producer")
         })?;
-        proto::validate_producer_identity(&expected_producer)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let expected_key =
+            proto::ProducerKey::try_from(&expected_producer).map_err(identity_status)?;
         let wire_pool_id = expected_producer.pool_id.as_ref().ok_or_else(|| {
-            Status::invalid_argument("SubscribeKvPool expected_producer requires pool_id")
+            RelayErrorReason::InvalidRequest
+                .status("SubscribeKvPool expected_producer requires pool_id")
         })?;
         let pool_id = pool_id_from_wire(wire_pool_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            .map_err(|error| RelayErrorReason::InvalidRequest.status(error.to_string()))?;
         let permit = self.acquire_stream_permit(StreamKind::Pool)?;
         let subscription = self
             .source
             .subscribe_pool(pool_id, move |actual| {
-                producer_to_wire(actual) == expected_producer
+                proto::ProducerKey::try_from(&producer_to_wire(actual))
+                    .is_ok_and(|actual_key| actual_key == expected_key)
             })
             .await?;
         tracing::debug!(%subscriber_id, %pool_id, "KV Relay pool subscriber connected");
@@ -294,12 +298,12 @@ impl proto::KvEventRelay for KvEventRelayService {
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(%subscriber_id, skipped, "KV Relay load subscriber lagged; forcing resubscribe");
-                        Err(Status::resource_exhausted(format!(
+                        Err(RelayErrorReason::SubscriberLagged.status(format!(
                             "load subscriber lagged by {skipped} complete windows; resubscribe"
                         )))?;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        Err(Status::unavailable("pool load publication stopped"))?;
+                        Err(RelayErrorReason::PublicationUnavailable.status("pool load publication stopped"))?;
                     }
                 }
             }
@@ -504,24 +508,32 @@ fn heartbeat_update(
 }
 
 pub(super) fn publication_status(error: PublicationError) -> Status {
-    let message = error.to_string();
-    match error.kind() {
-        PublicationErrorKind::NotFound => Status::not_found(message),
-        PublicationErrorKind::ProducerMismatch | PublicationErrorKind::InvalidPublication => {
-            Status::failed_precondition(message)
-        }
-        PublicationErrorKind::Unavailable => Status::unavailable(message),
-        PublicationErrorKind::ResourceExhausted => Status::resource_exhausted(message),
-        PublicationErrorKind::Internal => Status::internal(message),
-    }
+    let reason = match error.kind() {
+        PublicationErrorKind::NotFound => RelayErrorReason::PoolNotFound,
+        PublicationErrorKind::ProducerMismatch => RelayErrorReason::ProducerChanged,
+        PublicationErrorKind::InvalidPublication => RelayErrorReason::InvalidPublication,
+        PublicationErrorKind::Unavailable => RelayErrorReason::PublicationUnavailable,
+        PublicationErrorKind::ResourceExhausted => RelayErrorReason::ResourceLimit,
+        PublicationErrorKind::SubscriberLagged => RelayErrorReason::SubscriberLagged,
+        PublicationErrorKind::SnapshotProgressTimeout => RelayErrorReason::SnapshotProgressTimeout,
+        PublicationErrorKind::Internal => RelayErrorReason::Internal,
+    };
+    reason.status(error.to_string())
+}
+
+fn identity_status(error: proto::WireIdentityError) -> Status {
+    let reason = if error.is_unsupported() {
+        RelayErrorReason::UnsupportedFeature
+    } else {
+        RelayErrorReason::InvalidRequest
+    };
+    reason.status(error.to_string())
 }
 
 #[allow(clippy::result_large_err)]
 fn require_contract(marker: u32) -> Result<(), Status> {
     if marker != proto::RELAY_CONTRACT_MARKER {
-        return Err(Status::failed_precondition(
-            "unsupported Relay v1 wire contract",
-        ));
+        return Err(RelayErrorReason::ContractMismatch.status("unsupported Relay v1 wire contract"));
     }
     Ok(())
 }
@@ -530,17 +542,15 @@ fn require_contract(marker: u32) -> Result<(), Status> {
 fn validate_subscriber_id(raw: String) -> Result<String, Status> {
     const MAX_BYTES: usize = 128;
     if raw.is_empty() {
-        return Err(Status::invalid_argument("subscriber_id must not be empty"));
+        return Err(RelayErrorReason::InvalidRequest.status("subscriber_id must not be empty"));
     }
     if raw.len() > MAX_BYTES {
-        return Err(Status::invalid_argument(format!(
-            "subscriber_id exceeds {MAX_BYTES} bytes"
-        )));
+        return Err(RelayErrorReason::InvalidRequest
+            .status(format!("subscriber_id exceeds {MAX_BYTES} bytes")));
     }
     if raw.chars().any(char::is_control) {
-        return Err(Status::invalid_argument(
-            "subscriber_id must not contain control characters",
-        ));
+        return Err(RelayErrorReason::InvalidRequest
+            .status("subscriber_id must not contain control characters"));
     }
     Ok(raw)
 }

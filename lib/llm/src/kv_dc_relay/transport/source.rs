@@ -11,6 +11,7 @@ use tonic::Status;
 
 use super::super::identity::{DcPoolCatalog, DcRelayIdentity};
 use super::super::load::PoolLoadSnapshot;
+use super::super::protocol::RelayErrorReason;
 use super::super::publication::{PoolPublicationStream, RelayPublicationSource};
 use super::super::topology::TopologySnapshot;
 
@@ -62,11 +63,13 @@ impl WanPublicationSource {
             .iter()
             .find(|pool| pool.pool_id() == pool_id)
             .map(|pool| pool.producer())
-            .ok_or_else(|| Status::not_found(format!("unknown pool {pool_id}")))?;
+            .ok_or_else(|| {
+                RelayErrorReason::PoolNotFound.status(format!("unknown pool {pool_id}"))
+            })?;
         if !identity_matches(expected) {
-            return Err(Status::failed_precondition(
-                "requested producer is no longer active",
-            ));
+            return Err(
+                RelayErrorReason::ProducerChanged.status("requested producer is no longer active")
+            );
         }
         self.publication
             .subscribe_pool(expected)

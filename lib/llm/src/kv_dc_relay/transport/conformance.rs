@@ -583,6 +583,10 @@ async fn replacement_generation_rejects_stale_subscribe_and_requires_a_new_snaps
         .await
         .unwrap_err();
     assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        proto::relay_error_reason(&stale),
+        Some(proto::RelayErrorReason::ProducerChanged)
+    );
 
     let mut second_stream = subscribe_pool(&mut client, second_producer.clone())
         .await
@@ -617,6 +621,10 @@ async fn pool_stream_limit_returns_resource_exhausted_and_allows_resubscribe() {
         .await
         .unwrap_err();
     assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        proto::relay_error_reason(&rejected),
+        Some(proto::RelayErrorReason::ResourceLimit)
+    );
 
     drop(first_stream);
     let mut replacement_stream = tokio::time::timeout(IO_TIMEOUT, async {
@@ -635,5 +643,53 @@ async fn pool_stream_limit_returns_resource_exhausted_and_allows_resubscribe() {
     receive_snapshot(&mut replacement_stream, &producer).await;
 
     drop((client, replacement_stream));
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn application_error_reasons_cross_the_grpc_boundary() {
+    let fixture = RelayFixture::start(|_| {}).await;
+    let mut client = fixture.client().await;
+    let status = client
+        .get_relay_info(proto::RelayInfoRequest { contract_marker: 0 })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        proto::relay_error_reason(&status),
+        Some(proto::RelayErrorReason::ContractMismatch)
+    );
+    let (_catalog, producer) = initial_catalog(&mut client).await;
+
+    let mut unsupported = producer.clone();
+    unsupported.pool_id.as_mut().unwrap().identity_version += 1;
+    let mut invalid = producer.clone();
+    invalid.layout_generation = 0;
+    let mut missing = producer.clone();
+    missing.pool_id.as_mut().unwrap().dc_id += 1;
+    for (request, reason, code) in [
+        (
+            unsupported,
+            proto::RelayErrorReason::UnsupportedFeature,
+            tonic::Code::FailedPrecondition,
+        ),
+        (
+            invalid,
+            proto::RelayErrorReason::InvalidRequest,
+            tonic::Code::InvalidArgument,
+        ),
+        (
+            missing,
+            proto::RelayErrorReason::PoolNotFound,
+            tonic::Code::NotFound,
+        ),
+    ] {
+        let status = subscribe_pool(&mut client, request).await.unwrap_err();
+        assert_eq!(status.code(), code);
+        assert_eq!(proto::relay_error_reason(&status), Some(reason));
+    }
+    let mut stream = subscribe_pool(&mut client, producer.clone()).await.unwrap();
+    receive_snapshot(&mut stream, &producer).await;
+    drop((stream, client));
     fixture.shutdown().await;
 }

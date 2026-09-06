@@ -20,6 +20,10 @@ Companion documents: [`../docs/architecture.md`](../docs/architecture.md)
 [`../docs/grpc-contract.md`](../docs/grpc-contract.md) (contract-level RPC and message
 semantics).
 
+The [v1 evolution rules](../docs/grpc-contract.md#v1-evolution) define additive compatibility,
+entry-scoped handling of unknown types, the frozen producer key, and machine-readable errors.
+The `kv-relay-error-reason` trailer supplements existing gRPC codes without changing data frames.
+
 ## RPC Contract
 
 The `KvEventRelay` service has five methods:
@@ -53,6 +57,8 @@ with an initialized publication hub. Pool subscribers also have bounded message 
 - the logical `DcId`.
 
 `ProducerIdentity` adds the producer incarnation, layout generation, and complete CKF format.
+Use `ProducerKey::try_from` for explicit v1 key equality, not protobuf message equality. Put
+extensible descriptive metadata in `KvPoolDescriptor`; identity composition is frozen in v1.
 Filter and load entries carry that exact producer identity. Topology members instead reference the
 stable `KvPoolId`; consumers resolve its current producer through the catalog. A consumer must
 reject identity, layout, or format drift before applying pool state.

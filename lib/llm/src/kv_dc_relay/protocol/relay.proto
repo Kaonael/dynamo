@@ -5,8 +5,12 @@ syntax = "proto3";
 
 package dynamo.kvrelay.v1;
 
-// Every top-level request and response carries contract_marker so messages
-// from a different Relay WAN contract fail closed.
+// v1 is a compatibility major, not a schema revision. Additive fields keep
+// protocol_version=1 and contract_marker=0x4B565231. Preserve field numbers,
+// types and meanings; reserve deleted field numbers and names. Incompatible
+// semantics require a new package. See ../docs/grpc-contract.md.
+// Unknown safety-relevant types make the affected pool/topology unsupported,
+// not the entire catalog. Never interpret unknown values as a known default.
 service KvEventRelay
 {
   rpc GetRelayInfo(RelayInfoRequest) returns (RelayInfo);
@@ -14,6 +18,24 @@ service KvEventRelay
   rpc SubscribeKvPool(SubscribeKvPoolRequest) returns (stream FilterUpdate);
   rpc SubscribeServingReadiness(SubscribeServingReadinessRequest) returns (stream ServingReadinessUpdate);
   rpc SubscribeKvPoolLoad(SubscribeKvPoolLoadRequest) returns (stream KvPoolLoadUpdate);
+}
+
+// Relay application errors carry this enum's exact symbolic name in the
+// ASCII trailer kv-relay-error-reason. Missing/unknown reasons fall back to
+// the gRPC status code; messages are diagnostic text, never a retry API.
+enum RelayErrorReason {
+  RELAY_ERROR_REASON_UNSPECIFIED = 0;
+  RELAY_ERROR_REASON_CONTRACT_MISMATCH = 1;
+  RELAY_ERROR_REASON_INVALID_REQUEST = 2;
+  RELAY_ERROR_REASON_UNSUPPORTED_FEATURE = 3;
+  RELAY_ERROR_REASON_POOL_NOT_FOUND = 4;
+  RELAY_ERROR_REASON_PRODUCER_CHANGED = 5;
+  RELAY_ERROR_REASON_RESOURCE_LIMIT = 6;
+  RELAY_ERROR_REASON_SUBSCRIBER_LAGGED = 7;
+  RELAY_ERROR_REASON_SNAPSHOT_PROGRESS_TIMEOUT = 8;
+  RELAY_ERROR_REASON_PUBLICATION_UNAVAILABLE = 9;
+  RELAY_ERROR_REASON_INVALID_PUBLICATION = 10;
+  RELAY_ERROR_REASON_INTERNAL = 11;
 }
 
 enum IdentitySource {
@@ -86,6 +108,9 @@ message CkfFormat
   uint32 slots_per_bucket = 5;
 }
 
+// Frozen v1 subscription key: all existing fields, recursively, participate
+// in equality. Add descriptive metadata to KvPoolDescriptor, not this key.
+// Changing identity composition or CKF interpretation requires a new contract.
 message ProducerIdentity
 {
   KvPoolId pool_id = 1;
@@ -114,6 +139,8 @@ message LoraModelTarget
 
 message ModelTarget
 {
+  // An unset target may be an unknown future oneof variant. Treat the
+  // affected pool as unsupported; never fall back to a base-model target.
   oneof target
   {
     BaseModelTarget base = 1;
@@ -134,6 +161,8 @@ message KvQuerySemantics
   KvQueryHashFormat hash_format = 2;
 }
 
+// Extensible descriptive metadata, separate from the frozen producer key.
+// New fields must be optional in meaning and preserve v1 defaults.
 message KvPoolDescriptor
 {
   ProducerIdentity producer = 1;

@@ -16,16 +16,93 @@ model behind the contract is in [`architecture.md`](architecture.md).
 
 Every top-level request and response carries a `fixed32 contract_marker` at
 field number 127. Its required value is `0x4B565231` (`KVR1`). Every response
-also carries `protocol_version` and the typed `RelayIdentity`. Both sides reject
-a mismatched marker or version with `FAILED_PRECONDITION`.
+also carries `protocol_version` and the typed `RelayIdentity`. The server rejects
+a mismatched request marker with `FAILED_PRECONDITION` / `CONTRACT_MISMATCH`.
+Consumers reject a mismatched response marker or version before applying any state.
 
 `RELAY_PROTOCOL_VERSION` is **1**. This is the first WAN contract intended for
 deployment. Earlier branch-local prototypes are not accepted; Relay and
-consumers must use the same contract.
+consumers must use the same compatibility major, not necessarily the same Dynamo release.
 
-All validation is **fail-closed**: unknown enum values (including
-`*_UNSPECIFIED`), duplicate set elements, empty required sets, and
-inconsistent namespaces are rejected rather than ignored.
+### v1 Evolution
+
+- Keep package `dynamo.kvrelay.v1`, protocol version `1`, and marker `KVR1` for additive changes.
+- Preserve existing field numbers, types, meanings, RPC names, and error reason names/numbers.
+  Reserve both numbers and names when removing fields or enum values; never reuse them.
+- Add fields only when absence preserves previous behavior. Readers ignore unknown protobuf
+  fields; writers cannot assume old readers retain them when reconstructing a request.
+- New enum values and `oneof` alternatives are not automatically semantically compatible.
+  Advertise new per-pool formats only with an explicit discriminator; old readers quarantine
+  the affected entry. Do not introduce new mandatory filter frame kinds into a v1 stream.
+- Identity composition, existing hash/CKF interpretations, and required behavior cannot change
+  under v1. Use a new package/service major for incompatible changes and keep v1 during migration.
+
+### Unknown Types and Validation
+
+Validate the envelope first, then each complete snapshot entry independently. The wire helpers
+return errors without mutating state; `WireIdentityError::is_unsupported()` distinguishes an
+unsupported entry from malformed known data. `*_UNSPECIFIED`, missing required fields, duplicate
+sets, and namespace inconsistencies remain invalid. `ServingReadinessState.UNKNOWN` is a valid
+state, not an unknown enum value.
+
+| Observation | Required scope and action |
+| --- | --- |
+| Unknown pool identity source/version, CKF/hash format, pool role, or model target | Quarantine the containing pool, including its previous CKF/load state. Keep unrelated supported pools from the complete snapshot. |
+| Unknown topology state or role, including member/adapter dependencies | Quarantine the entire topology entry; never remove the unknown dependency and infer `READY`. Keep unrelated entries. |
+| Unknown filter frame kind or unsupported CBI1 payload | Invalidate only that pool replica and close its stream. Do not skip a frame and continue applying deltas. |
+| Missing or unknown `ModelTarget.target` alternative | Treat the pool as unsupported. Protobuf readers cannot distinguish an unknown alternative from an unset `oneof`; never infer a base target. |
+| Malformed entry with a trustworthy key | Quarantine that entry; never retain its old usable state as a fallback. |
+| Invalid envelope, duplicate top-level keys, or entries that cannot be identified safely | Invalidate the affected state plane; do not partially apply an ambiguous snapshot. |
+
+An unsupported entry is not permission to use default semantics. A newly received complete
+snapshot replaces the previous supported view, even if some entries are quarantined. These are
+consumer requirements; this package does not implement a consumer state machine.
+
+### Producer Identity Key
+
+`ProducerIdentity` is the frozen v1 subscription key. Equality includes:
+
+- `pool_id.identity_version`, both domain digests **and their sources**, and `dc_id`;
+- `producer_incarnation` and `layout_generation`;
+- every existing `ckf_format` field: version, seed, bucket count, fingerprint bits, and slots per bucket.
+
+Rust callers use `ProducerKey::try_from(&identity)` to validate and compare these explicit fields.
+Metadata belongs in `KvPoolDescriptor`, not in the identity or its nested messages. Endpoint,
+registrations, roles, and future descriptive fields do not participate in generation equality.
+Their updates still require catalog/query/readiness revalidation, but do not alone restart a CKF
+subscription. Never change the meaning of an existing key field or silently drop it from equality.
+
+### Machine-Readable Errors
+
+Relay application errors include the ASCII trailing metadata key `kv-relay-error-reason`.
+Its value is the exact protobuf `RelayErrorReason` name, for example
+`RELAY_ERROR_REASON_PRODUCER_CHANGED`. This is a custom trailer, not `google.rpc.Status`
+inside `grpc-status-details-bin`; no error payload is inserted into the data stream.
+Rust callers can use `relay_error_reason(&tonic::Status)`. Diagnostic message text is not stable.
+
+The table omits the common `RELAY_ERROR_REASON_` prefix:
+
+| Reason | gRPC code | Client action |
+| --- | --- | --- |
+| `CONTRACT_MISMATCH` | `FAILED_PRECONDITION` | Stop retries with this contract; use a compatible client/server major. |
+| `INVALID_REQUEST` | `INVALID_ARGUMENT` | Fix the request; do not retry unchanged. |
+| `UNSUPPORTED_FEATURE` | `FAILED_PRECONDITION` | Quarantine the requested pool; wait for supported semantics or upgrade. |
+| `POOL_NOT_FOUND` | `NOT_FOUND` | Refresh catalog, drop withdrawn state; subscribe only to an advertised producer. |
+| `PRODUCER_CHANGED` | `FAILED_PRECONDITION` | Drop the old replica, refresh catalog, and subscribe to the current key. |
+| `RESOURCE_LIMIT` | `RESOURCE_EXHAUSTED` | Retry admission with bounded exponential backoff and jitter; reduce subscriptions if persistent. |
+| `SUBSCRIBER_LAGGED` | `RESOURCE_EXHAUSTED` | Invalidate this stream's state and reopen from a full snapshot/window with backoff. Other planes remain independent. |
+| `SNAPSHOT_PROGRESS_TIMEOUT` | `RESOURCE_EXHAUSTED` | Discard incomplete assembly, fix draining/backpressure, and reopen with backoff. |
+| `PUBLICATION_UNAVAILABLE` | `UNAVAILABLE` | Invalidate the affected stream state, refresh catalog for pool streams, and reconnect with backoff. |
+| `INVALID_PUBLICATION` | `FAILED_PRECONDITION` | Invalidate the replica and refresh catalog; do not keep retrying the same fenced generation. |
+| `INTERNAL` | `INTERNAL` | Invalidate the affected stream state, refresh catalog, and retry with backoff; surface persistent failures. |
+
+Older servers, proxies, and gRPC itself can return statuses without this trailer. Unknown or
+`UNSPECIFIED` reasons are equivalent to absent reasons: use the status code, never message parsing.
+For `FAILED_PRECONDITION`, refresh identity/catalog and verify the envelope; do not blindly retry
+an unchanged request. For `RESOURCE_EXHAUSTED` or `UNAVAILABLE`, reconnect with backoff; a pool
+stream always starts with a new snapshot. Request errors need correction. Authentication and
+authorization errors belong to the external proxy. An unexpected clean EOF also invalidates the
+affected stream state and requires reconnecting; it is not proof that cached state remains fresh.
 
 ## RPCs
 

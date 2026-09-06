@@ -19,6 +19,16 @@ owns lazy pool hubs, snapshot cuts, CBI1 encoding, bounded queues, generation fe
 snapshot progress deadlines. Idle hubs can be evicted to admit another pool; later subscribers
 capture a fresh snapshot from the same producer generation.
 
+An initialized hub retains its CKF mirror and capacity permit while idle. Eviction reclaims both
+without retiring the producer generation or withdrawing the pool from the catalog. Admission
+limits therefore bound resident mirrors even across sequential subscribe/drop requests.
+
+Snapshot encoding failure, an encoder-task panic, or a publication invariant failure (identity,
+lease, sequence, or bucket state) fences the producer generation. Catalog withdrawal is the
+authoritative signal that the generation is no longer publishable. Encoder-task cancellation
+closes only that subscriber stream, with `UNAVAILABLE` in the gRPC adapter; a client-local
+snapshot progress timeout also leaves the generation valid for other subscribers.
+
 The gRPC adapter consumes publication frames and catalog, readiness, and load projections. It
 adds protobuf envelopes, transport admission, and heartbeats only after the initial snapshot is
 complete. It does not maintain another CKF mirror or implement a second publication pipeline.
@@ -44,15 +54,29 @@ never assumes another component's internal state.
 
 ## The two projections
 
-```text
-Inputs                          Projections (both: complete revisioned snapshots)
-──────                          ─────────────────────────────────────────────────
-cards ─┬─▶ endpoint membership ─┬─▶ Pool catalog        (KV facts, per endpoint)
-       │                        │     KvPoolDescriptor, CKF stream, load stream
-availability ──────────────────┤
-                                └─▶ Topology projection (serving facts, per
-KV sources ────▶ materialization      (namespace, canonical model))
-                                        TopologyEntry
+```mermaid
+flowchart LR
+    subgraph inputs["Discovery inputs"]
+        cards["Model deployment cards"]
+        availability["Instance availability"]
+        sources["KV event sources"]
+    end
+
+    membership["Endpoint membership"]
+    materialization["Pool materialization"]
+
+    subgraph projections["Projections: complete revisioned snapshots"]
+        catalog["Pool catalog<br/>KV facts per endpoint<br/>KvPoolDescriptor"]
+        topology["Serving topology<br/>(namespace, canonical model)<br/>TopologyEntry"]
+    end
+
+    cards --> membership
+    membership --> materialization
+    sources --> materialization
+    materialization --> catalog
+    membership --> topology
+    availability --> topology
+    topology -.->|"Optional stable KvPoolId reference"| catalog
 ```
 
 - The **pool catalog** answers "what KV state exists and how to query it".

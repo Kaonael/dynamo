@@ -8,8 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 Service `dynamo.kvrelay.v1.KvEventRelay`, defined in
 [`../protocol/relay.proto`](../protocol/relay.proto). This document is the
 contract-level view: RPCs, message semantics, validation, and lifecycle rules.
-Byte-level framing of the CKF payload (CBI1) and identity derivation are
-specified in [`../protocol/README.md`](../protocol/README.md); the producer
+The transport-neutral CKF payload (CBI1) is specified in the
+[protocol README](../protocol/README.md#cbi1-payload); the producer
 model behind the contract is in [`architecture.md`](architecture.md).
 
 ## Envelope and versioning
@@ -20,9 +20,12 @@ also carries `protocol_version` and the typed `RelayIdentity`. The server reject
 a mismatched request marker with `FAILED_PRECONDITION` / `CONTRACT_MISMATCH`.
 Consumers reject a mismatched response marker or version before applying any state.
 
-`RELAY_PROTOCOL_VERSION` is **1**. This is the first WAN contract intended for
-deployment. Earlier branch-local prototypes are not accepted; Relay and
-consumers must use the same compatibility major, not necessarily the same Dynamo release.
+`RELAY_PROTOCOL_VERSION` is **1**. Relay and consumers must use the same compatibility major,
+not necessarily the same Dynamo release.
+
+`RelayIdentity` separates the backing runtime instance (`drt_instance_id`) from the Relay's
+lifecycle (`relay_incarnation`). Each `KvDcRelay::start` call generates a new incarnation,
+including restarts that reuse the same runtime instance.
 
 ### v1 Evolution
 
@@ -157,6 +160,26 @@ the next snapshot is withdrawn.
 Same-target name repeats across pools are allowed. If one lookup name resolves to more than one
 distinct `BindingIdentity`, a consumer name index omits it fail-closed.
 
+Catalog revisions may skip numbers when watch notifications coalesce. Each update is complete;
+replace the local catalog with the first snapshot after reconnecting.
+
+#### Query Semantics and Model Targets
+
+`KvQuerySemantics` defines one atomic token-to-sequence-hash format:
+
+- `DYNAMO_STANDARD_V1` uses `kv_block_size` token windows.
+- `DYNAMO_EAGLE_V1` uses `kv_block_size + 1` token windows with a `kv_block_size` stride.
+
+Each format also fixes token and multimodal encoding, request-wide LoRA/cache-namespace salting,
+local block hashing, and rolling sequence hashing. Compute hashes separately for each pool using
+its declared semantics; Prefill and Decode formats can differ. Unknown or unspecified formats
+must not fall back to a known format.
+
+The producer emits one canonical base target and any LoRA targets backed by that model. For a LoRA
+request, the hash salt is the canonical `ModelTarget.lora.adapter`, not an alias or the
+registration's lookup ID. Base-model requests use no LoRA salt. Base and adapter KV entries share
+one physical pool while retaining distinct cache keys.
+
 ### SubscribeKvPool
 
 The request names an exact `expected_producer: ProducerIdentity` taken from
@@ -214,6 +237,16 @@ sums use the same saturating `u64` arithmetic as the local load aggregator, so
 the Relay forwards a saturated value as `u64::MAX`. Neither incomplete coverage
 nor zero capacity may be read as zero load.
 
+Full rank coverage does not prove current rank liveness. The Relay retains the latest value per
+rank without a rank timestamp, and a change-deduplicating publisher need not heartbeat or retry.
+A new WAN window therefore cannot establish per-rank freshness; that requires publisher
+heartbeats or rank-scoped freshness metadata.
+
+An empty `pools` list is a valid idle window. Use local receive time to track WAN stream freshness;
+`observed_ms` is producer wall-clock metadata, not a cross-data-center freshness guarantee.
+Router-local decode and prefill scheduler events are excluded because they have no publisher
+identity and cannot be aggregated authoritatively across router replicas.
+
 ## Consumer lifecycle rules
 
 | Observation | Required consumer reaction |
@@ -228,3 +261,10 @@ nor zero capacity may be read as zero load.
 Routing is always gated by the topology plane and matched by the pool plane:
 pool presence alone never implies routability, and the two planes may disagree
 transiently at revision boundaries.
+
+Keep catalog, pool filters, readiness, and load as independent state machines. Install a filter
+only after validating its complete snapshot; apply deltas only when Relay identity, producer
+identity, format, and base sequence match the installed state. A gap, malformed CBI1 frame, or
+identity drift invalidates only the affected pool replica. Replace readiness from the first
+complete snapshot after reconnecting. Replace load from the next complete window; load gaps
+require reopening only that stream and do not invalidate CKF state.

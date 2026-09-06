@@ -8,7 +8,7 @@ subtitle: Endpoint-local KV pools, serving topology, and the universal publicati
 **Experimental.** NVIDIA Dynamo's DC KV Relay exports compact facts about a data center's
 key-value (KV) cache and serving topology. It keeps exact block ownership local and publishes a
 Cuckoo-filter (CKF) projection for each pool, avoiding replication of every worker's full event
-stream across the WAN. A consumer decides which pools to compare and where to send requests.
+stream across the WAN. Consumers decide how to query and use the published facts.
 
 For deployment, see [Deploy the DC KV Relay](../../../../kubernetes/kv-aware-routing/kv-dc-relay.md).
 For flags and defaults, see [DC KV Relay Configuration](../../../../reference/components/kv-dc-relay-configuration.md).
@@ -117,7 +117,11 @@ The universal publisher provides an initial snapshot followed by contiguous delt
 lazy publication hubs, bounded queues, snapshot encoding, and generation fencing. The WAN adapter
 forwards its Cuckoo Bucket Images v1 (CBI1) payloads and adds transport envelopes and heartbeats.
 
-A CKF match is evidence for routing, not proof of a reusable prefix. Fingerprints can produce
+A consumer reconstructs each pool's CKF from snapshots and deltas and chooses its own storage
+layout and query strategy. The publication contract does not require a particular consumer
+implementation or use case. Endpoint resolution and request forwarding are outside its scope.
+
+A CKF match indicates possible prefix presence, not proof of a reusable prefix. Fingerprints can produce
 false positives; a capacity failure can also cause an omission. Publication and consumer recovery
 preserve stream consistency, not an exact remote copy of every worker's ownership index.
 

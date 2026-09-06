@@ -24,7 +24,7 @@ the [publisher's transport-neutral codec](../publication/cbi1.rs).
 - [Protobuf schema](relay.proto) and [gRPC contract](../docs/grpc-contract.md): the
   `dynamo.kvrelay.v1` adapter's RPCs, wire identity, compatibility, errors, and client rules.
 - [Component usage](../../../../../components/src/dynamo/kv_dc_relay/README.md#usage):
-  startup, listener configuration, and the optional external mTLS sidecar.
+  minimal startup and links to deployment and configuration documentation.
 
 The standard build includes the protocol package and plaintext gRPC server; `--bind` enables
 the listener. The independent `ckf-diagnostics` Cargo feature enables optional diagnostics.

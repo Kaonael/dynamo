@@ -5,12 +5,28 @@ SPDX-License-Identifier: Apache-2.0
 
 # KV DC Relay: Producer Architecture
 
-One Relay runs per data center. It observes the DC-local Dynamo deployment and
-publishes two independent, WAN-consumable projections of it. This document
-describes the producer model: which facts the Relay consumes, what it derives
-from them, and how each Dynamo deployment shape maps onto the published state.
-The wire encoding is specified in [`grpc-contract.md`](grpc-contract.md) and
-[`../protocol/README.md`](../protocol/README.md).
+This document describes the Rust implementation: module ownership, actor and hub lifecycle,
+admission, and recovery invariants. For the system model and deployment shapes, see
+[Multi-DC KV Routing](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/developer-guide/knowledge-base/modular-components/router/multi-dc-kv-routing.md).
+For deployment and runtime options, see the
+[Kubernetes how-to](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/kubernetes/kv-aware-routing/kv-dc-relay.md)
+and [configuration reference](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/reference/components/kv-dc-relay-configuration.md).
+Wire semantics are specified in [the gRPC contract](grpc-contract.md) and
+[the protocol README](../protocol/README.md).
+
+## Module Map
+
+| Module | Responsibility |
+| --- | --- |
+| [`host.rs`](../host.rs) | Shared runtime/discovery integration, endpoint task supervision, recovery, and shutdown. |
+| [`discovery.rs`](../discovery.rs), [`resolution.rs`](../resolution.rs) | Membership projection, conflicts, and canonical indexer-domain resolution. |
+| [`pool_registry.rs`](../pool_registry.rs) | Active pool generations and catalog withdrawal. |
+| [`actor.rs`](../actor.rs) | Exact rank ownership, refcounts, CKF mutation, and publication cuts. |
+| [`topology.rs`](../topology.rs), [`load.rs`](../load.rs) | Serving readiness and worker-authoritative load projections. |
+| [`publication.rs`](../publication.rs) | Transport-neutral source, streams, frames, and error categories. |
+| [`publication/hub.rs`](../publication/hub.rs), [`publication/stream.rs`](../publication/stream.rs) | Lazy mirrors, bounded fanout, snapshot bootstrap, and stream continuity. |
+| [`transport/server.rs`](../transport/server.rs), [`transport/grpc.rs`](../transport/grpc.rs) | WAN listener, RPC adaptation, transport admission, and heartbeats. |
+| [`protocol.rs`](../protocol.rs) | Protobuf types, explicit wire identity validation, and shared codec exports. |
 
 ## Universal Publication Boundary
 
@@ -33,6 +49,16 @@ The gRPC adapter consumes publication frames and catalog, readiness, and load pr
 adds protobuf envelopes, transport admission, and heartbeats only after the initial snapshot is
 complete. It does not maintain another CKF mirror or implement a second publication pipeline.
 The protobuf CBI1 helpers reuse the publisher's codec.
+
+The first subscriber initializes one hub for its producer generation. The hub acquires an actor
+publication lease and copies the CKF. Each subscriber captures a consistent snapshot cut and a
+bounded delta queue; snapshot encoding runs outside async worker threads under a concurrency
+limit. Later subscribers share the hub but receive their own cut and queue. Before the first
+subscription, there is no publication hub or full mirror.
+
+CBI1 deltas contain absolute bucket images. Their per-bucket idempotence and sequence checks do
+not make an arbitrary multi-bucket update atomic; consumers must validate and install complete
+frames before exposing updated state.
 
 The listener is plaintext HTTP/2 gRPC. mTLS is an optional external sidecar deployment described
 in the [transport security boundary](grpc-contract.md#transport-security-boundary), not a Relay
@@ -128,6 +154,12 @@ consumers therefore use only canonical hashes. LoRA and cache-namespace salts
 are already part of the token hash, so this boundary does not require
 backend-specific hashing logic.
 
+The actor refcounts exact full hashes across worker/rank owners. A first owner inserts one CKF
+fingerprint; additional owners only increment the refcount. Removing an owner removes the
+fingerprint only when the last owner disappears. Unknown removals are no-ops. Exact ownership
+remains authoritative: a CKF fingerprint can collide, and a capacity failure before mutation
+commit can leave an observable omission without corrupting that ownership.
+
 ## Topology projection
 
 The topology key is `(namespace, canonical model id)`, where the canonical
@@ -167,39 +199,15 @@ per endpoint. Distinct base cards on the same endpoint that share the same
 
 ## Deployment shapes
 
-**Aggregated.** One endpoint → one pool (`pool_roles: [AGGREGATED]`) → one
-READY entry with one member. Worker replicas do not split the pool; they are
-`(worker_id, dp_rank)` sources of one CKF. Multiple aggregated models in one
-namespace are fully independent keys.
+Aggregated, PD, EPD, and LoRA examples are maintained in the
+[system model](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/developer-guide/knowledge-base/modular-components/router/multi-dc-kv-routing.md).
+The implementation uses the same endpoint-local materialization and namespace-wide dependency
+evaluation for each shape, rather than separate deployment-specific publication paths.
 
-**Prefill/decode disaggregation.** Two endpoints → two pools with distinct
-`PoolId`s, CKFs, and load entries (`[PREFILL]` and `[DECODE]`) → one entry with
-two members. Both CKFs are meaningful — this mirrors the local router, where
-both legs are KV-aware: prefill workers publish their own KV events (prefix
-reuse on the prefill side drives time to first token (TTFT)), decode events
-drive decode-side reuse.
-Their query semantics may differ within one topology (prefill hashes are always
-the standard format; decode may use a speculative format), so hashes must be
-computed per pool. Death of either role turns the entry `UNAVAILABLE` while
-both pools stay published.
-
-**Encode/prefill/decode (EPD), multimodal.** Adds an encode endpoint. Encode
-participates in readiness (its `needs` DNF requires a P+D pair or an aggregated peer) but does
-not publish KV: it stays a member with no pool link unless it ever advertises
-an active KV event source, in which case it materializes an ordinary
-endpoint-local pool.
-
-**LoRA.** An adapter is not a pool, not a load entry, and not a top-level
-topology entry. It is an extra `ModelRegistration` on its base pool's
-descriptor and an element of the base entry's `adapters[]`. Base and adapter KV
-share one physical CKF, separated by the hash salt (the canonical adapter
-name; base requests are unsalted). Adapter readiness requires the base
-topology to be ready *and* adapter membership on every applicable role —
-DECODE, AGGREGATED, and PREFILL; ENCODE is a required topology dependency of
-the base but never adapter-bearing.
-
-**Legacy.** Cards without `worker_type` produce `pool_roles: [LEGACY]` and the
-namespace-wide legacy fallback described above.
+Adapter readiness is nested under the base entry and requires a ready base topology plus adapter
+membership on each applicable role (Prefill, Decode, Aggregated). Encode remains a base dependency
+but is not adapter-bearing. Legacy cards produce `pool_roles: [LEGACY]` and activate the fallback
+described above.
 
 ## What the producer deliberately does not publish
 

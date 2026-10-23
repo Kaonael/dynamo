@@ -2022,6 +2022,10 @@ redirects:
   - source: "/dynamo/zh-CN/v1.5.1/reference/observability/local-resource-monitor-guide.md"
     destination: "https://github.com/ai-dynamo/dynamo/blob/v1.5.1/docs/fern/pages/reference/observability/local-resource-monitor-guide.md"
 
+  - source: "/dynamo/dev/kubernetes/kv-aware-routing/deploy-the-dc-kv-relay-experimental"
+    destination: "/dynamo/dev/kubernetes/kv-aware-routing/deploy-the-pool-relay-experimental"
+  - source: "/dynamo/dev/reference/components/dc-kv-relay-configuration"
+    destination: "/dynamo/dev/reference/components/pool-relay-configuration"
   - source: "/dynamo/dev/recipes/nemotron-3-5-super-vl-120b-a12b"
     destination: "/dynamo/dev/recipes/nemotron-3-5-super-vl"
 

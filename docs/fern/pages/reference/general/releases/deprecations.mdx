@@ -17,6 +17,52 @@ Upgrading? Pick the version you run today to see the dependency migration and th
 
 <UpgradeSelector />
 
+## Unreleased
+
+<span className="dynref-badge dynref-badge--red">Removed</span> **The experimental KV DC Relay is renamed to Pool Relay.**
+
+Update launch commands, imports, and integrations using the following names. The previous
+module, binding, CLI flag, and environment variable are removed without aliases.
+
+| Previous name | Replacement |
+| --- | --- |
+| `python -m dynamo.kv_dc_relay` | `python -m dynamo.pool_relay` |
+| `dynamo.llm.KvDcRelay` | `dynamo.llm.PoolRelay` |
+| `--dc-id` / `DYN_DC_ID` | `--cluster-id` / `DYN_CLUSTER_ID` |
+| `dynamo_llm::kv_dc_relay`, `KvDcRelay*` | `dynamo_llm::pool_relay`, `PoolRelay*` |
+| `DcId`, `PoolId::dc_id()` | `ClusterId`, `PoolId::cluster_id()` |
+| `DcRelayIdentity`, `DcPoolDescriptor`, `DcPoolCatalog` | `PoolRelayIdentity`, `PoolDescriptor`, `PoolCatalogSnapshot` |
+| Runtime component `kv_dc_relay` / `kv_dc_relay_<dc-hash>` | `pool_relay` / `pool_relay_<cluster-hash>` |
+| Diagnostic JSON and serialized Rust identity field `dc_id` | `cluster_id` |
+| Runtime metric label `service="kv_dc_relay"` | `service="pool_relay"` |
+
+Keep the configured identity value unchanged during migration: its hash and binary encoding
+remain stable. The identity names the discovery cluster, independent of physical location.
+The gRPC service is now `dynamo.poolrelay.v1.PoolRelay`. Update clients and Kubernetes
+gRPC health probes together; the old service and method paths are no longer served.
+
+| Previous gRPC surface | Replacement |
+| --- | --- |
+| `dynamo.kvrelay.v1.KvEventRelay` | `dynamo.poolrelay.v1.PoolRelay` |
+| `GetRelayInfo` | `GetInfo` |
+| `WatchKvPoolCatalog` | `WatchCatalog` |
+| `SubscribeServingReadiness` | `WatchReadiness` |
+| `SubscribeKvPool` | `WatchKvIndex` |
+| `SubscribeKvPoolLoad`, `SubscribeServingLoad` | `WatchLoad` |
+| `KvPoolId.dc_id` | `PoolId.cluster_id` |
+| `KvPoolDescriptor`, `KvPoolCatalogSnapshot`, `KvPoolCatalogUpdate` | `PoolDescriptor`, `PoolCatalogSnapshot`, `PoolCatalogUpdate` |
+| `ServingReadinessUpdate`, `ServingReadinessState` | `ReadinessUpdate`, `ReadinessState` |
+| `FilterUpdate`, `FilterUpdateKind` | `KvIndexUpdate`, `KvIndexUpdateKind` |
+| `ServingLoadUpdate`, `PoolServingLoad`, `ModelServingLoad` | `LoadUpdate`, `PoolLoad`, `ModelLoad` |
+| `DYN_RELAY_MAX_SERVING_LOAD_SUBSCRIBERS` | `DYN_RELAY_MAX_LOAD_SUBSCRIBERS` for the combined stream |
+
+Request message names follow their RPC names (`GetInfoRequest`, `WatchCatalogRequest`,
+`WatchReadinessRequest`, `WatchKvIndexRequest`, `WatchLoadRequest`). `WatchLoad` carries
+scheduler load and KV occupancy in each `PoolLoad`, with independent statuses on `load`
+and `kv`; model frontend load remains in `ModelLoad`. Existing field numbers, the `KVR1`
+contract marker, and protocol version 1 are preserved. The merged load shape requires
+clients to read KV occupancy from `PoolLoad.kv`.
+
 <a id="v151"></a>
 
 ## v1.5.1 — Oct 6, 2026

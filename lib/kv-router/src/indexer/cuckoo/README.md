@@ -6,32 +6,32 @@ SPDX-License-Identifier: Apache-2.0
 # Cuckoo KV Indexer
 
 This directory contains the Cuckoo-filter (CKF) producer, publication protocol, and
-read-optimized global consumer used by the DC KV Relay architecture. The implementation has two
+read-optimized global consumer used by the Pool Relay architecture. The implementation has two
 different storage roles over one compatible packed-bucket format:
 
-- `DcCkfState` is the single-owner, mutable producer for one DC-local pool.
+- `DcCkfState` is the single-owner, mutable producer for one cluster-local pool.
 - `GlobalCkfIndexer` is the concurrent, transposed consumer for one indexer domain across as many
-  as 16 DC pool lanes.
+  as 16 pool lanes.
 
 The producer and consumer deliberately have different ownership models. The producer needs exact
 full-hash ownership to interpret removals. The consumer needs compact, concurrent prefix search
-across DCs and stores only the lossy CKF projection.
+across clusters and stores only the lossy CKF projection.
 
 For the higher-level Relay and recovery model, see
-[Multi-DC KV Routing and the DC Relay](../../../../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/multi-dc-kv-routing.md).
+[Pool Relay Concepts](../../../../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/multi-dc-kv-routing.md).
 
 ## Core concepts
 
-An `IndexerDomainId` identifies one logical KV indexer namespace. A `PoolId` adds a stable `DcId`
-and identifies exactly one DC-local producer and publication stream:
+An `IndexerDomainId` identifies one logical KV indexer namespace. A `PoolId` adds a stable `ClusterId`
+and identifies exactly one cluster-local producer and publication stream:
 
 ```text
-PoolId = (IndexerDomainId, DcId)
+PoolId = (IndexerDomainId, ClusterId)
 ```
 
 Native runtime endpoints are bindings for a pool, not part of the CKF protocol identity. A global
 consumer owns one immutable indexer domain. Each configured lane belongs to a distinct pool and
-therefore a distinct DC within that domain.
+therefore a distinct cluster within that domain.
 
 ## Producer invariants
 
@@ -121,7 +121,7 @@ bucket 1: [dc lane 0, dc lane 1, ...]
 ...
 ```
 
-This transposition lets one probe compare the same candidate buckets across all ready DC lanes.
+This transposition lets one probe compare the same candidate buckets across all ready pool lanes.
 Queries return the matching `PoolId` and prefix depth for each lane; runtime code resolves the pool
 to a serving endpoint afterward.
 
